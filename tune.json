@@ -1,0 +1,17 @@
+{
+    "pump_Kp": 1.0,
+    "pump_Ki": 0.1,
+    "pump_Kd": 0.1,
+    "peltier_Kp": 20.0,
+    "peltier_Ki": 1.0,
+    "peltier_Kd": 0.2,
+    "temp_ema_alpha": 0.1,
+    "temp_ema_count": 1,
+    "moisture_ema_alpha": 0.1,
+    "moisture_ema_count": 1,
+    "temp_deadband": 1.0,
+    "moisture_deadband": 1.0,
+    "cutoff": 64,
+    "der_tau": 1.0,
+    "aw_limit": 2.0
+}

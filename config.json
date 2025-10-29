@@ -1,0 +1,7 @@
+{
+    "moisture_range": [
+        40,
+        60
+    ],
+    "target_inner_temp": 20
+}
