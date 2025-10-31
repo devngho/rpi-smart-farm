@@ -43,7 +43,10 @@ async def read_task():
 
     async with PacketConnection(PORT) as link:
        while True:
-            kind, packet = await link.read_packet()
+            v = await link.read_packet()
+            if v is None:
+                continue
+            kind, packet = v
             if kind == KIND_SENSOR_REPORT:
                 if last_report is not None:
                     last_command = process_report(packet)
