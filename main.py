@@ -39,7 +39,7 @@ with open('./tune.json', 'r', encoding='utf-8') as f:
 
 async def read_task(): 
     global last_report, last_command
-    PORT = "/dev/ttyUSB3"  # Windows면 "COM3", macOS는 "/dev/tty.usbmodemXXXX"
+    PORT = "/dev/ttyAMA3"  # Windows면 "COM3", macOS는 "/dev/tty.usbmodemXXXX"
 
     async with PacketConnection(PORT) as link:
        while True:
