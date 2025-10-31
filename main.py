@@ -80,6 +80,8 @@ def process_report(new_report: SensorReport) -> ReconcilerCommand:
         report=new_report,
         dt=dt
     )
+    
+    return command
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):

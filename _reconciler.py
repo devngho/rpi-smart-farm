@@ -98,42 +98,35 @@ def reconcile_sensor_data(
     state.filt_temp  = _ema_update(state.filt_temp,  temp_sma,  tune.temp_ema_alpha)
     state.filt_moist = _ema_update(state.filt_moist, moist_sma, tune.moisture_ema_alpha)
 
-    # ---- 1) Moisture (Pump) PID with deadband, derivative LPF, anti-windup ----
+    # ---- 1) Moisture (Pump) - Simple On/Off Control (No PID) ----
     lo, hi = config.moisture_range
-    target_moist = (lo + hi) / 2
-    # Deadband: within [lo - db, hi + db] → error=0
+    
+    # 간단한 on/off 제어 (데드밴드 적용)
     moist_db_lo = lo - tune.moisture_deadband
     moist_db_hi = hi + tune.moisture_deadband
-    moist_error = 0.0 if (moist_db_lo <= state.filt_moist <= moist_db_hi) else (target_moist - state.filt_moist)
-
-    # Derivative with 1st-order LPF
-    a_der = tune.der_tau / (tune.der_tau + dt) if tune.der_tau > 0 else 0.0
-    raw_d_m = (moist_error - state.last_moisture_error) / dt
-    state.der_moist = a_der * state.der_moist + (1 - a_der) * raw_d_m
-
-    # Conditional integration (freeze when saturated in worsening direction)
-    u_noI_pump = tune.pump_Kp * moist_error + tune.pump_Kd * state.der_moist
-    u_tmp = u_noI_pump + tune.pump_Ki * state.integral_moisture
-    u_tmp_sat = _clamp(u_tmp, 0.0, 1023.0)
-    worsen = (u_tmp_sat >= 1023.0 and moist_error > 0) or (u_tmp_sat <= 0.0 and moist_error < 0)
-    if not worsen and moist_error != 0.0:
-        state.integral_moisture += moist_error * dt
-
-    # Integral contribution clamp (anti-windup)
-    I_pump = tune.pump_Ki * state.integral_moisture
-    if tune.pump_Ki > 0:
-        I_pump = _clamp(I_pump, -tune.aw_limit, tune.aw_limit)
-        state.integral_moisture = I_pump / tune.pump_Ki  # keep state consistent
-
-    pump_u = u_noI_pump + I_pump
-    pump_u = _clamp(pump_u, 0.0, 1023.0)
-    state.last_moisture_error = moist_error
-    pump_level = int(round(pump_u))
-
+    
+    if state.filt_moist < moist_db_lo:
+        # 너무 건조 -> 펌프 켜기
+        pump_level = 1023
+    elif state.filt_moist > moist_db_hi:
+        # 너무 습함 -> 펌프 끄기
+        pump_level = 0
+    else:
+        # 데드밴드 내 -> 이전 상태 유지 (히스테리시스)
+        # 여기서는 간단히 중간값 근처면 꺼둠
+        if state.filt_moist > (lo + hi) / 2:
+            pump_level = 0
+        else:
+            pump_level = 1023
+    
+    # 컷오프 적용
     if pump_level < tune.cutoff:
         pump_level = 0
 
     # ---- 2) Temperature (Peltier) PID ----
+    # Derivative with 1st-order LPF
+    a_der = tune.der_tau / (tune.der_tau + dt) if tune.der_tau > 0 else 0.0
+    
     temp_error = config.target_inner_temp - state.filt_temp
     if abs(temp_error) < tune.temp_deadband:
         temp_error = 0.0
