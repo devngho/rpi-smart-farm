@@ -80,7 +80,7 @@ def process_report(new_report: SensorReport) -> ReconcilerCommand:
         report=new_report,
         dt=dt
     )
-    
+
     return command
 
 @asynccontextmanager
@@ -90,6 +90,13 @@ async def lifespan(app: FastAPI):
     yield
     # 종료 시 태스크 취소
     task.cancel()
+    # send pump and peltier to 0
+    if last_command is not None:
+        print("Shutting down: sending zero commands")
+        async with PacketConnection("/dev/ttyAMA3") as link:
+            await link.send_pump(0)
+            await link.send_peltier(0, 0)
+            await link.send_fans(0)
     try:
         await task
     except asyncio.CancelledError:
