@@ -137,26 +137,26 @@ class PacketConnection:
                     continue
                 
                 read_count += 1
-                print(f"[{read_count}] Raw data received ({len(raw)} bytes): {raw}")
+                # print(f"[{read_count}] Raw data received ({len(raw)} bytes): {raw}")
                 
                 try:
                     line = raw.decode(self.encoding, errors="ignore").strip()
-                    print(f"[{read_count}] Decoded line: '{line}'")
+                    # print(f"[{read_count}] Decoded line: '{line}'")
                 except UnicodeError as e:
-                    print(f"[{read_count}] Decode error: {e}")
+                    # print(f"[{read_count}] Decode error: {e}")
                     continue
                 
                 if not line:
-                    print(f"[{read_count}] Empty line after strip")
+                    # print(f"[{read_count}] Empty line after strip")
                     continue
                 
                 parsed = self._parse_line(line)
                 if parsed is None:
-                    print(f"[{read_count}] Failed to parse line: '{line}'")
+                    # print(f"[{read_count}] Failed to parse line: '{line}'")
                     continue
                 
                 kind, payload = parsed
-                print(f"[{read_count}] Parsed - kind: {kind}, payload: {payload}")
+                # print(f"[{read_count}] Parsed - kind: {kind}, payload: {payload}")
                 
                 # 하트비트는 타임스탬프만 업데이트하고 큐에는 넣지 않음 (선택사항)
                 if kind == KIND_HEARTBEAT:

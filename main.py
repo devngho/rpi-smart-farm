@@ -52,12 +52,14 @@ async def read_task():
             if kind == KIND_SENSOR_REPORT:
                 if last_report is not None:
                     last_command = process_report(packet)
-                    await link.send_pump(last_command.pump_level)
-                    await link.send_peltier(last_command.peltier_level, last_command.peltier_forward)
-                    if last_command.peltier_level >= 64:
-                        await link.send_fans(1023)
-                    else:
-                        await link.send_fans(0)
+                    if last_command is not None:
+                        print(f"Sending Command: {last_command}")
+                        await link.send_pump(last_command.pump_level)
+                        await link.send_peltier(last_command.peltier_level, last_command.peltier_forward)
+                        if last_command.peltier_level >= 64:
+                            await link.send_fans(1023)
+                        else:
+                            await link.send_fans(0)
                 last_report = packet
                 print(f"Sensor Report: {packet}")
             elif kind == Heartbeat.KIND:
