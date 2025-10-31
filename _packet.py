@@ -51,8 +51,23 @@ class PacketConnection:
     async def open(self):
         if self.ser:
             return
-        self.ser = aioserial.AioSerial(port=self.port, baudrate=self.baudrate)
-        await asyncio.sleep(0.1)  # 초기화 대기
+        print(f"Opening serial port: {self.port} at {self.baudrate} baud")
+        self.ser = aioserial.AioSerial(
+            port=self.port, 
+            baudrate=self.baudrate,
+            timeout=1,
+            write_timeout=1
+        )
+        print(f"Serial port opened: {self.ser.is_open}")
+        await asyncio.sleep(0.5)  # 초기화 대기 시간 증가
+        
+        # 버퍼 비우기 (중요!)
+        if hasattr(self.ser, 'reset_input_buffer'):
+            self.ser.reset_input_buffer()
+        if hasattr(self.ser, 'reset_output_buffer'):
+            self.ser.reset_output_buffer()
+        
+        print("Serial buffers cleared")
         
         # 백그라운드 리더 시작
         self._last_heartbeat_time = time.monotonic()
@@ -105,47 +120,70 @@ class PacketConnection:
 
     async def _background_reader(self):
         """백그라운드에서 계속 패킷을 읽어서 큐에 저장"""
+        print("Background reader started")
+        read_count = 0
+        
         while True:
             try:
                 if not self.ser:
+                    print("Serial port not available, stopping reader")
                     break
                 
+                # readline_async 대신 read 시도
                 raw = await self.ser.readline_async()
+                
                 if not raw:
                     await asyncio.sleep(0.01)
                     continue
                 
+                read_count += 1
+                print(f"[{read_count}] Raw data received ({len(raw)} bytes): {raw}")
+                
                 try:
-                    line = raw.decode(self.encoding, errors="strict").strip()
-                except UnicodeError:
+                    line = raw.decode(self.encoding, errors="ignore").strip()
+                    print(f"[{read_count}] Decoded line: '{line}'")
+                except UnicodeError as e:
+                    print(f"[{read_count}] Decode error: {e}")
                     continue
                 
                 if not line:
+                    print(f"[{read_count}] Empty line after strip")
                     continue
                 
                 parsed = self._parse_line(line)
                 if parsed is None:
+                    print(f"[{read_count}] Failed to parse line: '{line}'")
                     continue
                 
                 kind, payload = parsed
+                print(f"[{read_count}] Parsed - kind: {kind}, payload: {payload}")
                 
                 # 하트비트는 타임스탬프만 업데이트하고 큐에는 넣지 않음 (선택사항)
                 if kind == KIND_HEARTBEAT:
                     self._last_heartbeat_time = time.monotonic()
+                    print(f"[{read_count}] Heartbeat received")
                     continue
                 
                 # 센서 리포트나 다른 패킷은 큐에 저장
                 if kind == KIND_SENSOR_REPORT:
-                    await self._packet_queue.put((kind, self._decode_sensor_report(payload)))
+                    report = self._decode_sensor_report(payload)
+                    print(f"[{read_count}] Sensor report decoded: {report}")
+                    await self._packet_queue.put((kind, report))
                 else:
+                    print(f"[{read_count}] Other packet type: {kind}")
                     await self._packet_queue.put((kind, tuple(payload)))
                     
             except asyncio.CancelledError:
+                print("Background reader cancelled")
                 break
-            except Exception:
-                # 에러 발생 시 연결 끊김으로 간주할 수 있음
+            except Exception as e:
+                print(f"[{read_count}] Exception in background reader: {type(e).__name__}: {e}")
+                import traceback
+                traceback.print_exc()
                 await asyncio.sleep(0.1)
                 continue
+        
+        print("Background reader stopped")
         
     async def _heartbeat_sender(self):
         """주기적으로 하트비트 전송"""
