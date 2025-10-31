@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 from dataclasses import asdict
 import json
 import os
+import time
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -67,7 +68,7 @@ async def read_task():
 def process_report(new_report: SensorReport) -> ReconcilerCommand:
     # reconcile
     global last_time, reconciler_state
-    current_time = new_report.timestamp
+    current_time = time.time()
     dt = current_time - last_time if last_time > 0 else 1e-3
     last_time = current_time
     reconciler_state, command = reconcile_sensor_data(
