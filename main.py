@@ -44,6 +44,7 @@ async def read_task():
     async with PacketConnection(PORT) as link:
        while True:
             v = await link.read_packet()
+            print(v)
             if v is None:
                 continue
             kind, packet = v
