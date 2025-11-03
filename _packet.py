@@ -16,7 +16,7 @@ KIND_CMD_FANS = 2
 
 @dataclass
 class SensorReport:
-    moisture: int
+    moisture: float
     temp_inner: int
     humd_inner: int
     temp_outer: int
@@ -263,6 +263,7 @@ class PacketConnection:
             raise ValueError(f"sensor report needs 5 ints, got {len(fields)}: {fields}")
         try:
             vals = [int(x, 10) for x in fields]
+            vals[0] = float(vals[0] / 1024 * 100.0)  # 습도 백분율로 변환
             vals.append(read_light())
         except ValueError as e:
             raise ValueError(f"sensor report contains non-integer: {fields}") from e
