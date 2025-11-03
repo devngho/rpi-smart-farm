@@ -151,7 +151,7 @@ def reconcile_sensor_data(
     peltier_u = _clamp(peltier_u, -1023.0, 1023.0)
     state.last_temp_error = temp_error
 
-    peltier_forward = 1 if peltier_u >= 0 else 0
+    peltier_forward = 0 if peltier_u >= 0 else 1
     peltier_level = int(round(abs(peltier_u)))
     if peltier_level < tune.cutoff:
         peltier_level = 0
