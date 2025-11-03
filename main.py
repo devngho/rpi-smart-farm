@@ -60,6 +60,10 @@ async def read_task():
                             await link.send_fans(1023)
                         else:
                             await link.send_fans(0)
+                        # if pump is enabled, we should disable it for a second concurrently
+                        if last_command.pump_level > 0:
+                            await asyncio.sleep(1.0)
+                            await link.send_pump(0)
                 last_report = packet
                 print(f"Sensor Report: {packet}")
             elif kind == Heartbeat.KIND:
