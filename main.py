@@ -64,6 +64,11 @@ async def read_task():
                         if last_command.pump_level > 0:
                             await asyncio.sleep(1.0)
                             await link.send_pump(0)
+                    else:
+                        print("No command generated")
+                        await link.send_pump(0)
+                        await link.send_peltier(0, 0)
+                        await link.send_fans(0)
                 last_report = packet
                 print(f"Sensor Report: {packet}")
             elif kind == Heartbeat.KIND:
