@@ -153,7 +153,13 @@ async def list_data_segments(n: int = 50):
 @app.websocket("/live")
 async def websocket_live_sensor(websocket):
     """웹소켓을 통한 실시간 센서 데이터 스트리밍"""
-    await websocket.accept()
+    # WebSocket은 origin 체크를 하지 않도록 설정
+    try:
+        await websocket.accept()
+    except Exception as e:
+        print(f"WebSocket accept failed: {e}")
+        return
+    
     previous_report = None
     previous_command = None
     try:
@@ -168,7 +174,10 @@ async def websocket_live_sensor(websocket):
     except Exception as e:
         print(f"WebSocket connection closed: {e}")
     finally:
-        await websocket.close()
+        try:
+            await websocket.close()
+        except:
+            pass
 
 if __name__ == "__main__":
     # open public
