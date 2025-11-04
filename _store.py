@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import time
 from typing import Any
 
 from dataclasses import asdict, dataclass
@@ -33,7 +34,8 @@ def add_segment(data: tuple[SensorReport, ReconcilerCommand], path: str = curren
     with open(path, 'a', encoding='utf-8') as f:
         json_line = json.dumps({
             'sensor_report': asdict(data[0]),
-            'reconciler_command': asdict(data[1])
+            'reconciler_command': asdict(data[1]),
+            'timestamp': time.time()
         }, ensure_ascii=False)
         f.write(json_line + '\n')
     
