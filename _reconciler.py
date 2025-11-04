@@ -143,12 +143,7 @@ def reconcile_sensor_data(
             # 너무 습함 -> 펌프 끄기
             pump_level = 0
         else:
-            # 데드밴드 내 -> 이전 상태 유지 (히스테리시스)
-            # 여기서는 간단히 중간값 근처면 꺼둠
-            if state.filt_moist > (lo + hi) / 2:
-                pump_level = 0
-            else:
-                pump_level = 1023
+            pump_level = 0
     
     # 컷오프 적용
     if pump_level < tune.cutoff:
