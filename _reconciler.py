@@ -1,11 +1,15 @@
 from dataclasses import dataclass, field
 from typing import Optional
+from datetime import datetime, time as dt_time
 from _packet import SensorReport
 
 @dataclass
 class ReconcilerConfig:
     moisture_range: tuple[int, int] = (20, 60)  # target moisture range (percent)
     target_inner_temp: int = 20                 # target inner temperature (Celsius)
+    # Pump disable time ranges: list of (start_hour, start_minute, end_hour, end_minute)
+    # Example: [(22, 0, 6, 0)] means disable pump from 22:00 to 06:00
+    pump_disable_times: list[tuple[int, int, int, int]] = field(default_factory=list)
 
 @dataclass
 class ReconcilerTune:
@@ -64,6 +68,29 @@ def _ema_update(prev: Optional[float], x: float, alpha: float) -> float:
     alpha = _clamp(alpha, 0.0, 1.0)
     return x if prev is None else (1 - alpha) * prev + alpha * x
 
+def _is_pump_disabled(config: ReconcilerConfig) -> bool:
+    """현재 시간이 펌프 비활성화 시간대에 속하는지 확인"""
+    if not config.pump_disable_times:
+        return False
+    
+    now = datetime.now()
+    current_time = now.time()
+    
+    for start_h, start_m, end_h, end_m in config.pump_disable_times:
+        start_time = dt_time(start_h, start_m)
+        end_time = dt_time(end_h, end_m)
+        
+        # 시간대가 자정을 넘어가는 경우 (예: 22:00 - 06:00)
+        if start_time > end_time:
+            if current_time >= start_time or current_time < end_time:
+                return True
+        # 일반적인 경우 (예: 09:00 - 17:00)
+        else:
+            if start_time <= current_time < end_time:
+                return True
+    
+    return False
+
 # ---------- main ----------
 def reconcile_sensor_data(
     prev_state: ReconcilerState,
@@ -101,23 +128,27 @@ def reconcile_sensor_data(
     # ---- 1) Moisture (Pump) - Simple On/Off Control (No PID) ----
     lo, hi = config.moisture_range
     
-    # 간단한 on/off 제어 (데드밴드 적용)
-    moist_db_lo = lo - tune.moisture_deadband
-    moist_db_hi = hi + tune.moisture_deadband
-    
-    if state.filt_moist < moist_db_lo:
-        # 너무 건조 -> 펌프 켜기
-        pump_level = 1023
-    elif state.filt_moist > moist_db_hi:
-        # 너무 습함 -> 펌프 끄기
+    # 시간대 체크: 비활성화 시간대면 펌프 끄기
+    if _is_pump_disabled(config):
         pump_level = 0
     else:
-        # 데드밴드 내 -> 이전 상태 유지 (히스테리시스)
-        # 여기서는 간단히 중간값 근처면 꺼둠
-        if state.filt_moist > (lo + hi) / 2:
+        # 간단한 on/off 제어 (데드밴드 적용)
+        moist_db_lo = lo - tune.moisture_deadband
+        moist_db_hi = hi + tune.moisture_deadband
+        
+        if state.filt_moist < moist_db_lo:
+            # 너무 건조 -> 펌프 켜기
+            pump_level = 1023
+        elif state.filt_moist > moist_db_hi:
+            # 너무 습함 -> 펌프 끄기
             pump_level = 0
         else:
-            pump_level = 1023
+            # 데드밴드 내 -> 이전 상태 유지 (히스테리시스)
+            # 여기서는 간단히 중간값 근처면 꺼둠
+            if state.filt_moist > (lo + hi) / 2:
+                pump_level = 0
+            else:
+                pump_level = 1023
     
     # 컷오프 적용
     if pump_level < tune.cutoff:
