@@ -67,4 +67,4 @@ def last_segments(n: int, directory: str = './data') -> list[str]:
     # ensure timestamp order
     segments.sort(key=lambda x: json.loads(x)['timestamp'])
 
-    return segments[:n]
+    return segments[-n:]
