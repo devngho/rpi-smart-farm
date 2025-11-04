@@ -55,7 +55,7 @@ def last_segments(n: int, directory: str = './data') -> list[str]:
         # read lines
         with open(file, 'r', encoding='utf-8') as f:
             lines = f.readlines()
-            for line in reversed(lines):
+            for line in lines: # from oldest to newest
                 segments.append(line.strip())
         
         if len(segments) >= n:
@@ -63,5 +63,8 @@ def last_segments(n: int, directory: str = './data') -> list[str]:
     
     if len(segments) < n:
         return segments
+    
+    # ensure timestamp order
+    segments.sort(key=lambda x: json.loads(x)['timestamp'])
 
     return segments[:n]
