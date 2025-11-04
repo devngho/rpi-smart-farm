@@ -25,7 +25,7 @@ def add_segment(data: tuple[SensorReport, ReconcilerCommand], path: str = curren
         lines = f.readlines()
         if len(lines) > 12 * 30: # 30 minutes at 5s interval
             # seperate to new file
-            timestamp = int(json.loads(lines[-1])['sensor_report']['timestamp'])
+            timestamp = int(json.loads(lines[-1])['timestamp'])
             path = f'./data/store_{timestamp}.jsonl'
 
             # rename
