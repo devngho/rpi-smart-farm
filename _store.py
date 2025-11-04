@@ -40,7 +40,7 @@ def add_segment(data: tuple[SensorReport, ReconcilerCommand], path: str = curren
 def list_segments(directory: str = './data') -> list[str]:
     files = []
     for filename in os.listdir(directory):
-        if filename.startswith('store_') and filename.endswith('.jsonl'):
+        if filename.startswith('store') and filename.endswith('.jsonl'):
             files.append(os.path.join(directory, filename))
     return sorted(files)
 
