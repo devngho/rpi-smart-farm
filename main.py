@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse
 import uvicorn
 from _packet import PacketConnection, KIND_SENSOR_REPORT, Heartbeat, SensorReport
 from _reconciler import ReconcilerCommand, ReconcilerConfig, ReconcilerState, ReconcilerTune, reconcile_sensor_data
-from _store import last_segments, list_segments
+from _store import add_segment, last_segments, list_segments
 
 last_report: SensorReport | None = None
 last_command: ReconcilerCommand | None = None
@@ -89,6 +89,8 @@ def process_report(new_report: SensorReport) -> ReconcilerCommand:
         report=new_report,
         dt=dt
     )
+    
+    add_segment((new_report, command))
 
     return command
 
