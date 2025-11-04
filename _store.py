@@ -50,7 +50,12 @@ def last_segments(n: int, directory: str = './data') -> list[str]:
     segments = []
 
     for file in reversed(files):
-        segments.append(file)
+        # read lines
+        with open(file, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+            for line in reversed(lines):
+                segments.append(line.strip())
+        
         if len(segments) >= n:
             break
     
