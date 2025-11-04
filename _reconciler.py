@@ -16,7 +16,7 @@ class ReconcilerTune:
     pump_Kp: float = 10.0
     pump_Ki: float = 0.1
     pump_Kd: float = 0.1
-    peltier_Kp: float = 30.0
+    peltier_Kp: float = 50.0
     peltier_Ki: float = 0.2
     peltier_Kd: float = 0.001
 
