@@ -171,4 +171,5 @@ async def websocket_live_sensor(websocket):
         await websocket.close()
 
 if __name__ == "__main__":
-    uvicorn.run(app, port=8000)
+    # open public
+    uvicorn.run(app, port=8000, host="0.0.0.0")

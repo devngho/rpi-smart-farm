@@ -18,15 +18,15 @@ class ReconcilerTune:
 
     # Smoothing (EMA) + warmup length (SMA)
     temp_ema_alpha: float = 0.1
-    temp_ema_count: int = 13
+    temp_ema_count: int = 1
     moisture_ema_alpha: float = 0.1
-    moisture_ema_count: int = 13
+    moisture_ema_count: int = 1
 
     # Deadbands
     temp_deadband: float = 1.0        # °C
     moisture_deadband: float = 1.0    # %
 
-    cutoff: int = 64                  # actuator cutoff level
+    cutoff: int = 64                    # actuator cutoff level
 
     # Derivative LPF and anti-windup
     der_tau: float = 1.0              # s (low-pass on derivative)
