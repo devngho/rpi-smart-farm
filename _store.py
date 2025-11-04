@@ -14,6 +14,11 @@ if not os.path.exists('./data'):
     os.makedirs('./data')
 
 def add_segment(data: tuple[SensorReport, ReconcilerCommand], path: str = current_target_path) -> None:
+    # if file is not exist, create it
+    if not os.path.exists(path):
+        with open(path, 'w', encoding='utf-8') as f:
+            pass
+
     # first, read the len
     with open(path, 'r', encoding='utf-8') as f:
         lines = f.readlines()
