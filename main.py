@@ -84,8 +84,8 @@ def process_report(new_report: SensorReport) -> ReconcilerCommand:
     last_time = current_time
     reconciler_state, command = reconcile_sensor_data(
         reconciler_state,
-        config=ReconcilerConfig(),
-        tune=ReconcilerTune(),
+        config=reconciler_config,
+        tune=reconciler_tune,
         report=new_report,
         dt=dt
     )
