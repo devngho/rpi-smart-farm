@@ -32,8 +32,8 @@ def add_segment(data: tuple[SensorReport, ReconcilerCommand], path: str = curren
 
     with open(path, 'a', encoding='utf-8') as f:
         json_line = json.dumps({
-            'sensor_report': data[0].dict(),
-            'reconciler_command': data[1].dict()
+            'sensor_report': asdict(data[0]),
+            'reconciler_command': asdict(data[1])
         }, ensure_ascii=False)
         f.write(json_line + '\n')
     
