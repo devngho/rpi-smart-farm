@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse
 import uvicorn
 from _packet import PacketConnection, KIND_SENSOR_REPORT, Heartbeat, SensorReport
 from _reconciler import ReconcilerCommand, ReconcilerConfig, ReconcilerState, ReconcilerTune, reconcile_sensor_data
-from _store import list_segments
+from _store import last_segments, list_segments
 
 last_report: SensorReport | None = None
 last_command: ReconcilerCommand | None = None
@@ -146,9 +146,9 @@ async def get_reconciler_state():
 async def list_data_segments(n: int = 50):
     """저장된 데이터 세그먼트 목록 반환"""
     # read n from url parameter
-    segments = list_segments()
+    segments = last_segments(n)
 
-    return {"segments": segments[:n]}
+    return {"segments": segments}
 
 @app.websocket("/live")
 async def websocket_live_sensor(websocket):
