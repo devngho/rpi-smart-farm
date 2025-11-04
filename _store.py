@@ -50,21 +50,19 @@ def last_segments(n: int, directory: str = './data') -> list[str]:
     files = list_segments(directory)
 
     segments = []
-
+    
+    # Process files in reverse order (newest first)
     for file in reversed(files):
-        # read lines
         with open(file, 'r', encoding='utf-8') as f:
             lines = f.readlines()
-            for line in lines: # from oldest to newest
+            # Reverse lines to process from newest to oldest within each file
+            for line in reversed(lines):
                 segments.append(line.strip())
         
         if len(segments) >= n:
             break
     
-    if len(segments) < n:
-        return segments
-    
-    # ensure timestamp order
-    segments.sort(key=lambda x: json.loads(x)['timestamp'])
+    # segments now contains newest first, so reverse to get oldest first
+    segments.reverse()
 
-    return segments[-n:]
+    return segments[:n] if len(segments) > n else segments
