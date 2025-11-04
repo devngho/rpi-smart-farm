@@ -38,6 +38,9 @@ with open('./config.json', 'r', encoding='utf-8') as f:
 with open('./tune.json', 'r', encoding='utf-8') as f:
     reconciler_tune = ReconcilerTune(**json.load(f))
 
+print("Reconciler Config:", reconciler_config)
+print("Reconciler Tune:", reconciler_tune)
+
 async def read_task(): 
     global last_report, last_command
     PORT = "/dev/ttyAMA3"  # Windows면 "COM3", macOS는 "/dev/tty.usbmodemXXXX"
