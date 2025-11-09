@@ -60,8 +60,23 @@ def last_segments(n: int, directory: str = './data') -> list[str]:
             lines = f.readlines()
             # Reverse lines to process from newest to oldest within each file
             for line in reversed(lines):
-                segments.append(line.strip())
-        
+                # json parse
+                segment: dict[str, Any] = json.loads(line)
+                # to csv-like
+                segments.append(
+                    (segment['sensor_report']['moisture'],
+                     segment['sensor_report']['temp_inner'],
+                     segment['sensor_report']['humd_inner'],
+                     segment['sensor_report']['temp_outer'],
+                     segment['sensor_report']['humd_outer'],
+                     segment['sensor_report']['illumination'],
+                     segment['reconciler_command']['pump_level'],
+                     segment['reconciler_command']['peltier_level'],
+                     segment['reconciler_command']['peltier_forward'],
+                     segment['timestamp']
+                    )
+                )
+
         if len(segments) >= n:
             break
     
