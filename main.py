@@ -7,6 +7,7 @@ import os
 import time
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 import uvicorn
 from _packet import PacketConnection, KIND_SENSOR_REPORT, Heartbeat, SensorReport
@@ -126,6 +127,8 @@ app.add_middleware(
     allow_methods=["*"],  # 모든 HTTP 메서드 허용
     allow_headers=["*"],  # 모든 헤더 허용
 )
+
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 @app.get("/sensor/latest")
 async def get_latest_sensor():

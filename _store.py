@@ -66,6 +66,7 @@ def last_segments(n: int, directory: str = './data') -> list[str]:
             break
     
     # segments now contains newest first, so reverse to get oldest first
-    segments.reverse()
+    segments = segments[:n] # take only n elements. because it's newest first, taking first n is correct
+    segments.reverse() # then reverse to get oldest first
 
-    return segments[-n:] if len(segments) > n else segments
+    return segments
