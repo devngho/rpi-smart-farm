@@ -50,23 +50,24 @@ def list_segments(directory: str = './data') -> list[str]:
     return sorted(files)
 
 def last_segments(n: int, directory: str = './data') -> list[str]:
+    if n <= 0:
+        return []
+    
     files = list_segments(directory)
-
     segments = []
     
     # Process files in reverse order (newest first)
     for file in reversed(files):
         with open(file, 'r', encoding='utf-8') as f:
             lines = f.readlines()
-            # Reverse lines to process from newest to oldest within each file
+            # Add lines in reverse order (newest first)
             for line in reversed(lines):
                 segments.append(line.strip())
-        
-        if len(segments) >= n:
-            break
+                if len(segments) == n:
+                    # Reverse to get oldest first and return immediately
+                    segments.reverse()
+                    return segments
     
-    # segments now contains newest first, so reverse to get oldest first
-    segments = segments[:n] # take only n elements. because it's newest first, taking first n is correct
-    segments.reverse() # then reverse to get oldest first
-
+    # If we have fewer than n segments, reverse and return what we have
+    segments.reverse()
     return segments
