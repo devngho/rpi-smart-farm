@@ -39,11 +39,22 @@ def add_segment(data: tuple[SensorReport, ReconcilerCommand], path: str = curren
         f.write(json_line + '\n')
 
 def list_segments(directory: str = './data') -> list[str]:
-    files = []
+    """Return segment files ordered oldest -> newest.
+
+    Rotated files are `store_<timestamp>.jsonl`; the active file is
+    `store.jsonl` and is always the newest.
+    """
+    rotated = []
+    active = []
     for filename in os.listdir(directory):
-        if filename.startswith('store') and filename.endswith('.jsonl'):
-            files.append(os.path.join(directory, filename))
-    return sorted(files)
+        if filename == 'store.jsonl':
+            active.append(os.path.join(directory, filename))
+        elif filename.startswith('store_') and filename.endswith('.jsonl'):
+            ts = filename[len('store_'):-len('.jsonl')]
+            if ts.isdigit():
+                rotated.append((int(ts), os.path.join(directory, filename)))
+    rotated.sort()
+    return [p for _, p in rotated] + active
 
 def last_segments(n: int, directory: str = './data') -> list[str]:
     if n <= 0:
@@ -58,6 +69,8 @@ def last_segments(n: int, directory: str = './data') -> list[str]:
             lines = f.readlines()
             # Add lines in reverse order (newest first)
             for line in reversed(lines):
+                if not line.strip():
+                    continue
                 segments.append(line.strip())
                 if len(segments) == n:
                     # Reverse to get oldest first and return immediately
