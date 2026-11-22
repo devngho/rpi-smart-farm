@@ -1,129 +1,141 @@
 # file: example.py
 import asyncio
-from contextlib import asynccontextmanager
-from dataclasses import asdict
-import json
 import os
 import time
-from fastapi import FastAPI
+from contextlib import asynccontextmanager, suppress
+from dataclasses import asdict
+
+import uvicorn
+from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
-import uvicorn
-from _packet import PacketConnection, KIND_SENSOR_REPORT, Heartbeat, SensorReport
-from _reconciler import ReconcilerCommand, ReconcilerConfig, ReconcilerState, ReconcilerTune, reconcile_sensor_data
-from _store import add_segment, last_segments, list_segments
+
+from _illumination import read_light
+from _packet import PacketConnection, SensorReport, open_link
+from _reconciler import (
+    ReconcilerCommand,
+    ReconcilerConfig,
+    ReconcilerState,
+    ReconcilerTune,
+    load_settings,
+    reconcile_sensor_data,
+)
+from _store import add_segment, last_segments
 
 last_report: SensorReport | None = None
 last_command: ReconcilerCommand | None = None
-last_time = 0.0
 reconciler_state = ReconcilerState()
 
-# initialize reconciler config and tune as needed
-reconciler_config = ReconcilerConfig()
-reconciler_tune = ReconcilerTune()
-
-# if files don't exist, create them with default values
-if not os.path.exists('./config.json'):
-    with open('./config.json', 'w', encoding='utf-8') as f:
-        f.write(json.dumps(asdict(reconciler_config), indent=4, ensure_ascii=False))
-
-if not os.path.exists('./tune.json'):
-    with open('./tune.json', 'w', encoding='utf-8') as f:
-        f.write(json.dumps(asdict(reconciler_tune), indent=4, ensure_ascii=False))
-
-# from file, init them
-with open('./config.json', 'r', encoding='utf-8') as f:
-    reconciler_config = ReconcilerConfig(**json.load(f))
-
-with open('./tune.json', 'r', encoding='utf-8') as f:
-    reconciler_tune = ReconcilerTune(**json.load(f))
+reconciler_config = load_settings('config.json', ReconcilerConfig(), create=True)
+reconciler_tune = load_settings('tune.json', ReconcilerTune(), create=True)
 
 print("Reconciler Config:", reconciler_config)
 print("Reconciler Tune:", reconciler_tune)
 
-async def read_task(): 
-    global last_report, last_command
-    PORT = "/dev/ttyAMA3"  # Windows면 "COM3", macOS는 "/dev/tty.usbmodemXXXX"
+async def record_reports(records: asyncio.Queue):
+    while True:
+        report, command = await records.get()
+        try:
+            report.illumination = await asyncio.to_thread(read_light)
+        except OSError:
+            report.illumination = None
+        try:
+            await asyncio.to_thread(add_segment, (report, command))
+        except (OSError, ValueError) as exc:
+            print(f'Sensor history unavailable: {exc}')
 
-    async with PacketConnection(PORT) as link:
-       while True:
-            v = await link.read_packet()
-            print(v)
-            if v is None:
-                continue
-            kind, packet = v
-            if kind == KIND_SENSOR_REPORT:
-                if last_report is not None:
-                    last_command = process_report(packet)
-                    if last_command is not None:
-                        print(f"Sending Command: {last_command}")
-                        await link.send_pump(last_command.pump_level)
-                        await link.send_peltier(last_command.peltier_level, last_command.peltier_forward)
-                        if last_command.peltier_level >= 64:
-                            await link.send_fans(1023)
-                        else:
-                            await link.send_fans(0)
-                        # if pump is enabled, we should disable it for a second concurrently
-                        if last_command.pump_level > 0:
-                            await asyncio.sleep(1.0)
-                            await link.send_pump(0)
-                    else:
-                        print("No command generated")
-                        await link.send_pump(0)
-                        await link.send_peltier(0, 0)
-                        await link.send_fans(0)
-                last_report = packet
-                print(f"Sensor Report: {packet}")
-            elif kind == Heartbeat.KIND:
-                print("Heartbeat received")
-            else:
-                print(f"Unknown packet kind: {kind}")
 
-def process_report(new_report: SensorReport) -> ReconcilerCommand:
-    # reconcile
-    global last_time, reconciler_state
-    current_time = time.time()
-    dt = current_time - last_time if last_time > 0 else 1e-3
-    last_time = current_time
-    reconciler_state, command = reconcile_sensor_data(
-        reconciler_state,
-        config=reconciler_config,
-        tune=reconciler_tune,
-        report=new_report,
-        dt=dt
-    )
-    
-    add_segment((new_report, command))
+async def control(link: PacketConnection, records: asyncio.Queue):
+    global last_command, last_report, reconciler_state
+    previous = None
+    pump_until = None
+    while True:
+        try:
+            report = await asyncio.wait_for(link.reports.get(), timeout=0.1)
+        except TimeoutError:
+            report = None
+        now = time.monotonic()
+        if pump_until is not None and now >= pump_until:
+            await link.send(0, 0)
+            pump_until = None
+            if last_command:
+                last_command = ReconcilerCommand(0, last_command.peltier_level, last_command.peltier_forward)
+        if previous is not None and now - previous >= reconciler_config.sensor_timeout_s:
+            if last_command and (last_command.peltier_level or last_command.pump_level):
+                await link.stop()
+                last_command = ReconcilerCommand(0, 0, 1)
+            pump_until = previous = None
+            reconciler_state = ReconcilerState()  # don't blend stale inputs into recovery
+        if report is None:
+            continue
+        deadline = report.received_monotonic + reconciler_config.sensor_timeout_s
+        if now >= deadline:
+            continue  # never apply an expired sample from the receive queue
+        if pump_until is not None:
+            deadline = min(deadline, pump_until)
+        dt = report.received_monotonic - previous if previous is not None else 0.001
+        previous = report.received_monotonic
+        # RX and heartbeat keep running during calculation. If the controller itself
+        # stalls past an output safety deadline, discard its result and stop the link.
+        async with asyncio.timeout(deadline - now):
+            reconciler_state, command = await asyncio.to_thread(
+                reconcile_sensor_data, reconciler_state, reconciler_config, reconciler_tune, report, dt)
+        if not link.reports.empty():
+            # A newer sample (possibly a sensor fault) arrived during calculation.
+            # Record this sample but only energize outputs from the newest one.
+            command = ReconcilerCommand(0, 0, 1)
+        await link.send(0, command.pump_level)
+        if not command.pump_level:
+            pump_until = None
+        elif pump_until is None:
+            pump_until = time.monotonic() + 1
+        await link.send(1, command.peltier_level, command.peltier_forward)
+        await link.send(2, command.fan_level)
+        last_report, last_command = report, command
+        # A stalled history disk must never stall serial safety checks.
+        if records.full():
+            records.get_nowait()
+        records.put_nowait((report, command))
 
-    return command
+
+async def read_task(port: str, records: asyncio.Queue):
+    global last_report, last_command, reconciler_state
+    while True:
+        try:
+            async with open_link(port) as link, asyncio.TaskGroup() as tasks:
+                tasks.create_task(link.heartbeat())
+                tasks.create_task(link.receive())
+                tasks.create_task(control(link, records))
+        except* OSError as exc:
+            print(f'USB serial connection lost: {exc.exceptions}')
+        finally:
+            last_report = last_command = None
+            reconciler_state = ReconcilerState()
+        await asyncio.sleep(2)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 시작 시 백그라운드 태스크 시작
-    task = asyncio.create_task(read_task())
-    yield
-    # 종료 시 태스크 취소
-    task.cancel()
-    # send pump and peltier to 0
-    if last_command is not None:
-        print("Shutting down: sending zero commands")
-        async with PacketConnection("/dev/ttyAMA3") as link:
-            await link.send_pump(0)
-            await link.send_peltier(0, 0)
-            await link.send_fans(0)
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass
+    port = os.environ.get('SMART_FARM_SERIAL_PORT')
+    if not port:
+        raise RuntimeError('Set SMART_FARM_SERIAL_PORT to the UNO /dev/serial/by-id/... path')
+    records = asyncio.Queue(maxsize=64)
+    async with asyncio.TaskGroup() as tasks:
+        serial_task = tasks.create_task(read_task(port, records))
+        history_task = tasks.create_task(record_reports(records))
+        try:
+            yield
+        finally:
+            serial_task.cancel()
+            history_task.cancel()
 
 app = FastAPI(lifespan=lifespan)
 
 # CORS 설정
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 모든 origin 허용 (프로덕션에서는 특정 도메인만 허용)
-    allow_credentials=True,
+    allow_origins=os.environ.get('SMART_FARM_CORS_ORIGINS', '*').split(','),
+    allow_credentials=bool(os.environ.get('SMART_FARM_CORS_ORIGINS')),
     allow_methods=["*"],  # 모든 HTTP 메서드 허용
     allow_headers=["*"],  # 모든 헤더 허용
 )
@@ -138,8 +150,8 @@ async def get_latest_sensor():
             status_code=404,
             content={"error": "No sensor data available yet"}
         )
-    
-    return asdict(last_report)
+
+    return last_report.snapshot(reconciler_config.sensor_timeout_s)
 
 @app.get("/reconciler/state")
 async def get_reconciler_state():
@@ -154,12 +166,12 @@ async def get_reconciler_state():
 async def list_data_segments(n: int = 50):
     """저장된 데이터 세그먼트 목록 반환"""
     # read n from url parameter
-    segments = last_segments(n)
+    segments = await asyncio.to_thread(last_segments, n)
 
     return {"segments": segments}
 
 @app.websocket("/live")
-async def websocket_live_sensor(websocket):
+async def websocket_live_sensor(websocket: WebSocket):
     """웹소켓을 통한 실시간 센서 데이터 스트리밍"""
     # WebSocket은 origin 체크를 하지 않도록 설정
     try:
@@ -167,26 +179,26 @@ async def websocket_live_sensor(websocket):
     except Exception as e:
         print(f"WebSocket accept failed: {e}")
         return
-    
-    previous_report = None
-    previous_command = None
+
+    previous_report = previous_command = object()  # send initial nulls while waiting for USB
     try:
         while True:
-            if last_report is not None and last_report != previous_report:
-                await websocket.send_json({'report': asdict(last_report)})
-                previous_report = last_report
-            if last_command is not None and last_command != previous_command:
-                await websocket.send_json({'command': asdict(last_command)})
-                previous_command = last_command
+            report = last_report.snapshot(reconciler_config.sensor_timeout_s) if last_report else None
+            command = {**asdict(last_command), 'fan_level': last_command.fan_level} if last_command else None
+            if report != previous_report:
+                await websocket.send_json({'report': report})
+                previous_report = report
+            if command != previous_command:
+                await websocket.send_json({'command': command})
+                previous_command = command
             await asyncio.sleep(1.0)  # 1초 간격으로 체크
     except Exception as e:
         print(f"WebSocket connection closed: {e}")
     finally:
-        try:
+        with suppress(RuntimeError):
             await websocket.close()
-        except:
-            pass
 
 if __name__ == "__main__":
-    # open public
-    uvicorn.run(app, port=8000, host="0.0.0.0")
+    # Preserve LAN access for the separately hosted dashboard; deployments can narrow the bind.
+    host = os.getenv('SMART_FARM_HOST', '0.0.0.0')  # noqa: S104
+    uvicorn.run(app, port=8000, host=host)

@@ -1,270 +1,154 @@
-from __future__ import annotations
 import asyncio
-import aioserial
+import logging
 import time
-from dataclasses import dataclass
-from typing import Optional, Tuple, Union, Callable
+from contextlib import asynccontextmanager, suppress
+from dataclasses import asdict, dataclass, field
+from math import isfinite
 
-from _illumination import read_light
+import aioserial
 
-# kinds
-KIND_SENSOR_REPORT = 0   # Arduino->RPi
-KIND_HEARTBEAT = 9       # both
-KIND_CMD_PUMP = 0        # RPi->Arduino
-KIND_CMD_PELTIER = 1
-KIND_CMD_FANS = 2
+KIND_SENSOR_REPORT = 0
+UNO_FIELDS = ('moisture', 'temp_inner', 'humd_inner', 'temp_outer', 'humd_outer')
+log = logging.getLogger(__name__)
+
 
 @dataclass
 class SensorReport:
-    moisture: float
-    temp_inner: int
-    humd_inner: int
-    temp_outer: int
-    humd_outer: int
-    illumination: Optional[float] = None
+    moisture: int
+    temp_inner: float | None
+    humd_inner: float | None
+    temp_outer: float | None
+    humd_outer: float | None
+    illumination: float | None = None
+    received_at: float = field(default_factory=time.time, init=False)
+    last_valid_at: dict[str, float | None] = field(init=False)
 
-@dataclass
-class Heartbeat:
-    pass
+    def __post_init__(self):
+        self.received_monotonic = time.monotonic()
+        self.last_valid_at = {key: self.received_at if getattr(self, key) is not None else None
+                              for key in UNO_FIELDS}
 
-ParsedPayload = Union[SensorReport, Heartbeat, tuple]
+    def keep_history(self, previous: 'SensorReport'):
+        for key in UNO_FIELDS:
+            if self.last_valid_at[key] is None:
+                self.last_valid_at[key] = previous.last_valid_at[key]
+
+    def snapshot(self, stale_after: float | None = None) -> dict:
+        # With no deadline this describes validity *at reception* (history).
+        stale = stale_after is not None and time.monotonic() - self.received_monotonic >= stale_after
+        return {**asdict(self), 'stale': stale,
+                'valid': {key: not stale and getattr(self, key) is not None for key in UNO_FIELDS}}
+
+
+def parse_report(line: bytes) -> SensorReport | None:
+    fields = line.strip().split(b',')
+    if len(fields) != 6 or fields[0] != b'0':
+        return None
+    try:
+        soil = int(fields[1])
+        if not 0 <= soil <= 1023:
+            return None
+        inner_t, inner_h, outer_t, outer_h = (
+            value if isfinite(value) else None for value in map(float, fields[2:])
+        )
+    except ValueError:
+        return None
+    return SensorReport(soil, inner_t, inner_h, outer_t, outer_h)
+
 
 class PacketConnection:
-    def __init__(self, port: str, baudrate: int = 9600, timeout: float = 5.0, encoding: str = "ascii", 
-                 heartbeat_timeout: float = 10.0):
-        self.port = port
-        self.baudrate = baudrate
-        self.timeout = timeout
-        self.encoding = encoding
-        self.heartbeat_timeout = heartbeat_timeout  # 하트비트 없이 이 시간이 지나면 연결 끊김으로 간주
-        self.ser: Optional[aioserial.AioSerial] = None
-        
-        # 내부 상태
-        self._reader_task: Optional[asyncio.Task] = None
-        self._packet_queue: asyncio.Queue = asyncio.Queue()
-        self._last_heartbeat_time: float = 0
-        self._is_alive: bool = False
+    def __init__(self, ser):
+        self.ser = ser
+        self.write_lock = asyncio.Lock()
+        self.opened_at = time.monotonic()
+        self.last_heartbeat: float | None = None
+        self.reports: asyncio.Queue[SensorReport] = asyncio.Queue(maxsize=8)
 
-        self._heartbeat_task: Optional[asyncio.Task] = None
+    async def send(self, *fields: int):
+        frame = (','.join(map(str, fields)) + '\n').encode('ascii')
+        async with self.write_lock:
+            if len(fields) > 1 and fields[1] and self.heartbeat_expired():
+                raise ConnectionError('Refusing output after UNO heartbeat timeout')
+            if await self.ser.write_async(frame) != len(frame):
+                raise OSError('incomplete serial write')
 
-    # ---- lifecycle ----
-    async def open(self):
-        if self.ser:
-            return
-        print(f"Opening serial port: {self.port} at {self.baudrate} baud")
-        self.ser = aioserial.AioSerial(
-            port=self.port, 
-            baudrate=self.baudrate,
-            timeout=1,
-            write_timeout=1
-        )
-        print(f"Serial port opened: {self.ser.is_open}")
-        await asyncio.sleep(0.5)  # 초기화 대기 시간 증가
-        
-        # 버퍼 비우기 (중요!)
-        if hasattr(self.ser, 'reset_input_buffer'):
-            self.ser.reset_input_buffer()
-        if hasattr(self.ser, 'reset_output_buffer'):
-            self.ser.reset_output_buffer()
-        
-        print("Serial buffers cleared")
-        
-        # 백그라운드 리더 시작
-        self._last_heartbeat_time = time.monotonic()
-        self._is_alive = True
-        self._reader_task = asyncio.create_task(self._background_reader())
+    async def stop(self):
+        await self.send(0, 0)
+        await self.send(1, 0, 1)
+        await self.send(2, 0)
 
-        self._heartbeat_task = asyncio.create_task(self._heartbeat_sender())
+    def heartbeat_expired(self) -> bool:
+        return time.monotonic() - (self.last_heartbeat or self.opened_at) >= 5
 
-    async def close(self):
-        # 백그라운드 태스크 정리
-        if self._reader_task:
-            self._reader_task.cancel()
-            try:
-                await self._reader_task
-            except asyncio.CancelledError:
-                pass
-            self._reader_task = None
-        
-        if self._heartbeat_task:
-            self._heartbeat_task.cancel()
-            try:
-                await self._heartbeat_task
-            except asyncio.CancelledError:
-                pass
-            self._heartbeat_task = None
-        
-        if self.ser:
-            try:
-                self.ser.close()
-            finally:
-                self.ser = None
-        
-        self._is_alive = False
-
-    async def __aenter__(self):
-        await self.open()
-        return self
-
-    async def __aexit__(self, exc_type, exc, tb):
-        await self.close()
-
-    def is_alive(self) -> bool:
-        """연결이 살아있는지 확인 (하트비트 기반)"""
-        if not self.ser or not self._is_alive:
-            return False
-        
-        # 마지막 하트비트 이후 시간 확인
-        elapsed = time.monotonic() - self._last_heartbeat_time
-        return elapsed < self.heartbeat_timeout
-
-    async def _background_reader(self):
-        """백그라운드에서 계속 패킷을 읽어서 큐에 저장"""
-        print("Background reader started")
-        read_count = 0
-        
+    async def heartbeat(self):
+        next_send = self.opened_at + 2
         while True:
-            try:
-                if not self.ser:
-                    print("Serial port not available, stopping reader")
-                    break
-                
-                # readline_async 대신 read 시도
-                raw = await self.ser.readline_async()
-                
-                if not raw:
-                    await asyncio.sleep(0.01)
-                    continue
-                
-                read_count += 1
-                # print(f"[{read_count}] Raw data received ({len(raw)} bytes): {raw}")
-                
-                try:
-                    line = raw.decode(self.encoding, errors="ignore").strip()
-                    # print(f"[{read_count}] Decoded line: '{line}'")
-                except UnicodeError as e:
-                    # print(f"[{read_count}] Decode error: {e}")
-                    continue
-                
-                if not line:
-                    # print(f"[{read_count}] Empty line after strip")
-                    continue
-                
-                parsed = self._parse_line(line)
-                if parsed is None:
-                    # print(f"[{read_count}] Failed to parse line: '{line}'")
-                    continue
-                
-                kind, payload = parsed
-                # print(f"[{read_count}] Parsed - kind: {kind}, payload: {payload}")
-                
-                # 하트비트는 타임스탬프만 업데이트하고 큐에는 넣지 않음 (선택사항)
-                if kind == KIND_HEARTBEAT:
-                    self._last_heartbeat_time = time.monotonic()
-                    print(f"[{read_count}] Heartbeat received")
-                    continue
-                
-                # 센서 리포트나 다른 패킷은 큐에 저장
-                if kind == KIND_SENSOR_REPORT:
-                    report = self._decode_sensor_report(payload)
-                    print(f"[{read_count}] Sensor report decoded: {report}")
-                    await self._packet_queue.put((kind, report))
-                else:
-                    print(f"[{read_count}] Other packet type: {kind}")
-                    await self._packet_queue.put((kind, tuple(payload)))
-                    
-            except asyncio.CancelledError:
-                print("Background reader cancelled")
-                break
-            except Exception as e:
-                print(f"[{read_count}] Exception in background reader: {type(e).__name__}: {e}")
-                import traceback
-                traceback.print_exc()
-                await asyncio.sleep(0.1)
+            now = time.monotonic()
+            deadline = (self.last_heartbeat or self.opened_at) + 5
+            if now >= deadline:
+                raise ConnectionError('UNO heartbeat timed out')
+            if now >= next_send:
+                await self.send(9)
+                next_send = now + 2
+            await asyncio.sleep(max(0, min(next_send, deadline) - time.monotonic()))
+
+    async def receive(self):
+        previous = None
+        async for line in self.lines():
+            if line is None:
                 continue
-        
-        print("Background reader stopped")
-        
-    async def _heartbeat_sender(self):
-        """주기적으로 하트비트 전송"""
+            report = parse_report(line)
+            if report is None:
+                log.warning('Ignoring malformed UNO frame: %r', line)
+                continue
+            if previous is not None:
+                report.keep_history(previous)
+            previous = report
+            try:
+                self.reports.put_nowait(report)
+            except asyncio.QueueFull as exc:
+                raise ConnectionError('Control is not keeping up with sensor frames') from exc
+
+    async def lines(self):
+        # A short USB read may end mid-frame. Discard oversized lines through LF.
+        partial = b''
+        dropping = False
         while True:
-            try:
-                await self.send_heartbeat()
-                await asyncio.sleep(self.heartbeat_timeout / 2)
-            except asyncio.CancelledError:
-                break
-            except Exception:
-                await asyncio.sleep(1.0)
-                continue
+            chunk = await self.ser.read_async(64)
+            parts = (partial + chunk).split(b'\n')
+            for line in parts[:-1]:
+                if not dropping and len(line) <= 256:
+                    if line.strip() == b'9':
+                        if self.heartbeat_expired():
+                            raise ConnectionError('Late UNO heartbeat')
+                        self.last_heartbeat = time.monotonic()
+                    else:
+                        yield line
+                elif not dropping:
+                    log.warning('Discarding UNO frame longer than 256 bytes')
+                dropping = False
+            partial = parts[-1]
+            if not dropping and len(partial) > 256:
+                log.warning('Discarding UNO frame longer than 256 bytes')
+                dropping = True
+            if dropping:
+                dropping, partial = True, b''
+            yield None  # tick safety deadlines even on an idle port
 
-    # ---- send helpers (RPi -> Arduino) ----
-    async def send_heartbeat(self):
-        await self._send_fields([str(KIND_HEARTBEAT)])
 
-    async def send_pump(self, level: int):
-        if not (0 <= level <= 1023):
-            raise ValueError("pump level must be 0..1023")
-        fields = [str(KIND_CMD_PUMP), str(level)]
-        await self._send_fields(fields)
-
-    async def send_peltier(self, level: int, is_forward: int):
-        if not (0 <= level <= 1023):
-            raise ValueError("peltier level must be 0..1023")
-        if is_forward not in (0, 1):
-            raise ValueError("is_forward must be 0 or 1")
-        fields = [str(KIND_CMD_PELTIER), str(level), str(is_forward)]
-        await self._send_fields(fields)
-
-    async def send_fans(self, level: int):
-        if not (0 <= level <= 1023):
-            raise ValueError("fans level must be 0..1023")
-        fields = [str(KIND_CMD_FANS), str(level)]
-        await self._send_fields(fields)
-
-    async def _send_fields(self, fields):
-        if not self.ser:
-            raise RuntimeError("serial not open")
-        line = ",".join(fields) + "\n"
-        await self.ser.write_async(line.encode(self.encoding, errors="strict"))
-
-    # ---- receive (Arduino -> RPi) ----
-    async def read_packet(self, deadline_sec: float = 1.0) -> Optional[Tuple[int, ParsedPayload]]:
-        """
-        큐에서 패킷을 가져옴 (백그라운드 리더가 채움)
-        반환: (kind, SensorReport/tuple_payload) 또는 None(타임아웃)
-        """
-        if not self.ser:
-            raise RuntimeError("serial not open")
-
+@asynccontextmanager
+async def open_link(port: str):
+    ser = aioserial.AioSerial(port=port, baudrate=9600, timeout=0.1,
+                              write_timeout=0.5, exclusive=True)
+    link = PacketConnection(ser)
+    try:
+        await link.send(9)
+        ser.reset_input_buffer()  # never act on a pre-session sensor frame
+        await link.stop()
+        yield link
+    finally:
         try:
-            return await asyncio.wait_for(
-                self._packet_queue.get(),
-                timeout=deadline_sec
-            )
-        except asyncio.TimeoutError:
-            return None
-
-    def _parse_line(self, line: str) -> Optional[tuple[str, int, list[str]]]:
-        parts = [p.strip() for p in line.split(",")]
-        # 첫 필드는 kind
-        try:
-            kind = int(parts[0], 10)
-        except (IndexError, ValueError):
-            return None
-        return kind, parts[1:]
-
-    def _decode_sensor_report(self, fields: list[str]) -> SensorReport:
-        """
-        기대 형태:
-        moisture, temp_inner, humd_inner, temp_outer, humd_outer
-        (모두 정수)
-        """
-        if len(fields) != 5:
-            raise ValueError(f"sensor report needs 5 ints, got {len(fields)}: {fields}")
-        try:
-            vals = [int(x, 10) for x in fields]
-            vals[0] = float(vals[0] / 1024 * 100.0)  # 습도 백분율로 변환
-            vals.append(read_light())
-        except ValueError as e:
-            raise ValueError(f"sensor report contains non-integer: {fields}") from e
-        return SensorReport(*vals)
+            with suppress(OSError):  # unplugged: preserve the original failure/cancellation
+                await link.stop()
+        finally:
+            ser.close()

@@ -1,10 +1,6 @@
-import asyncio
 import json
 import os
-import time
-from typing import Any
-
-from dataclasses import asdict, dataclass
+from dataclasses import asdict
 
 from _packet import SensorReport
 from _reconciler import ReconcilerCommand
@@ -21,7 +17,7 @@ def add_segment(data: tuple[SensorReport, ReconcilerCommand], path: str = curren
             pass
 
     # first, read the len
-    with open(path, 'r', encoding='utf-8') as f:
+    with open(path, encoding='utf-8') as f:
         lines = f.readlines()
         if len(lines) > 12 * 30: # 30 minutes at 5s interval
             # seperate to new file
@@ -36,12 +32,12 @@ def add_segment(data: tuple[SensorReport, ReconcilerCommand], path: str = curren
 
     with open(path, 'a', encoding='utf-8') as f:
         json_line = json.dumps({
-            'sensor_report': asdict(data[0]),
+            'sensor_report': data[0].snapshot(),
             'reconciler_command': asdict(data[1]),
-            'timestamp': time.time()
-        }, ensure_ascii=False)
+            'timestamp': data[0].received_at
+        }, ensure_ascii=False, allow_nan=False)
         f.write(json_line + '\n')
-    
+
 def list_segments(directory: str = './data') -> list[str]:
     files = []
     for filename in os.listdir(directory):
@@ -52,13 +48,13 @@ def list_segments(directory: str = './data') -> list[str]:
 def last_segments(n: int, directory: str = './data') -> list[str]:
     if n <= 0:
         return []
-    
+
     files = list_segments(directory)
     segments = []
-    
+
     # Process files in reverse order (newest first)
     for file in reversed(files):
-        with open(file, 'r', encoding='utf-8') as f:
+        with open(file, encoding='utf-8') as f:
             lines = f.readlines()
             # Add lines in reverse order (newest first)
             for line in reversed(lines):
@@ -67,7 +63,7 @@ def last_segments(n: int, directory: str = './data') -> list[str]:
                     # Reverse to get oldest first and return immediately
                     segments.reverse()
                     return segments
-    
+
     # If we have fewer than n segments, reverse and return what we have
     segments.reverse()
     return segments

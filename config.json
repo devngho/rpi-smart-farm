@@ -1,7 +1,9 @@
 {
     "moisture_range": [
-        40,
-        60
+        410,
+        614
     ],
-    "target_inner_temp": 20
+    "target_inner_temp": 20,
+    "cooling_direction": 1,
+    "sensor_timeout_s": 15.0
 }
