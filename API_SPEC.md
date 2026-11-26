@@ -190,6 +190,44 @@ Arduino 기반 센서 시스템의 REST API 및 WebSocket 명세입니다.
 }
 ```
 
+#### `GET /history?start={unix}&end={unix}&points={n}`
+
+차트용 시계열 히스토리를 **컬럼 형식**으로 반환합니다. 범위 안의 레코드가 `points`개보다 많으면
+서버에서 epoch 기준으로 정렬된 시간 버킷(5s, 10s, … 1d)으로 다운샘플링하여 버킷별 평균/최소/최대를 돌려줍니다.
+파싱된 세그먼트 파일은 메모리에 캐시되며(1분/15분 롤업 포함), 활성 파일은 추가된 부분만 읽습니다.
+
+**Query Parameters**:
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `start` | `float` | `end - 6h` | 시작 시각 (Unix 초) |
+| `end` | `float` | 최신 레코드 시각 | 끝 시각 (Unix 초) |
+| `points` | `int` | 1000 | 최대 포인트 수 (최대 20000). `0`이면 다운샘플링 없이 원본 레코드 반환 (내보내기용) |
+
+**Response**: `200 OK`
+```json
+{
+  "start": 1795646726.7, "end": 1795668326.7,
+  "first": 1795348157.3, "last": 1795668326.7,
+  "step": 120,
+  "count": 4306,
+  "t": [1795646742.9, 1795646820.7],
+  "series": {"moisture": [642.1, 640.3], "temp_inner": [15.9, null], "...": []},
+  "min":    {"moisture": [630, 628], "...": []},
+  "max":    {"moisture": [655, 651], "...": []}
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `first`, `last` | 저장된 전체 히스토리의 처음/마지막 시각 |
+| `step` | 버킷 크기(초). `0`이면 원본 레코드이며 `min`/`max`는 생략 |
+| `count` | 범위 안의 원본 레코드 수 |
+| `t` | 각 포인트 시각 (버킷 내 레코드들의 평균 시각) |
+| `series` | 컬럼별 값 (버킷 평균). 수신 시점에 유효하지 않았던 값, 단위를 알 수 없는 레거시 습도, 조도 센서 없음(-1)은 `null` |
+
+컬럼: `moisture`, `temp_inner`, `humd_inner`, `temp_outer`, `humd_outer`, `illumination`,
+`pump_level`, `peltier_level`, `peltier_forward`, `fan_level` (`fan_level`은 `peltier_level`에서 유도).
+
 ---
 
 ## 🔧 Mock Server Only Endpoints
@@ -501,6 +539,9 @@ curl http://localhost:8000/reconciler/state
 
 # 데이터 세그먼트 목록
 curl http://localhost:8000/segments?n=10
+
+# 최근 24시간 히스토리 (최대 1000 포인트)
+curl "http://localhost:8000/history?start=$(($(date +%s)-86400))&points=1000"
 
 # Mock Server: 환경 설정
 curl -X POST "http://localhost:8000/environment/set?key=moisture&value=30"
