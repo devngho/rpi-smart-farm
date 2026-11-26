@@ -1,5 +1,7 @@
 # file: example.py
 import asyncio
+import json
+import math
 import os
 import time
 from contextlib import asynccontextmanager, suppress
@@ -9,8 +11,9 @@ import uvicorn
 from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
+from _history import store as history_store
 from _illumination import read_light
 from _packet import PacketConnection, SensorReport, open_link
 from _reconciler import (
@@ -123,11 +126,14 @@ async def lifespan(app: FastAPI):
     async with asyncio.TaskGroup() as tasks:
         serial_task = tasks.create_task(read_task(port, records))
         history_task = tasks.create_task(record_reports(records))
+        # Parse recent history once up front so the dashboard's first chart load is fast.
+        warm_task = tasks.create_task(asyncio.to_thread(history_store.query, None, None, 1000))
         try:
             yield
         finally:
             serial_task.cancel()
             history_task.cancel()
+            warm_task.cancel()
 
 app = FastAPI(lifespan=lifespan)
 
@@ -169,6 +175,21 @@ async def list_data_segments(n: int = 50):
     segments = await asyncio.to_thread(last_segments, n)
 
     return {"segments": segments}
+
+@app.get("/history")
+async def get_history(start: float | None = None, end: float | None = None, points: int = 1000):
+    """Columnar sensor/command history for [start, end] (Unix seconds).
+
+    Defaults to the 6 hours up to the newest record. When the range holds more than
+    `points` rows it is bucketed into aligned time buckets (mean + min/max per bucket);
+    `points=0` returns raw rows (for export).
+    """
+    start = start if start is not None and math.isfinite(start) else None
+    end = end if end is not None and math.isfinite(end) else None
+    points = min(points, 20000)
+    body = await asyncio.to_thread(
+        lambda: json.dumps(history_store.query(start, end, points), separators=(',', ':'), allow_nan=False))
+    return Response(body, media_type='application/json', headers={'Cache-Control': 'no-cache'})
 
 @app.websocket("/live")
 async def websocket_live_sensor(websocket: WebSocket):

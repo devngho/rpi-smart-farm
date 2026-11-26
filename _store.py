@@ -10,33 +10,39 @@ current_target_path = './data/store.jsonl'
 if not os.path.exists('./data'):
     os.makedirs('./data')
 
+ROTATE_AFTER_LINES = 12 * 30  # 30 minutes at 5s interval
+
+# Lines in the active file, counted once and then tracked in memory so that an
+# append no longer re-reads the whole file every 5 seconds.
+_active_lines: dict[str, int] = {}
+
+
+def _count_lines(path: str) -> int:
+    with open(path, 'rb') as f:
+        return sum(chunk.count(b'\n') for chunk in iter(lambda: f.read(1 << 16), b''))
+
+
 def add_segment(data: tuple[SensorReport, ReconcilerCommand], path: str = current_target_path) -> None:
-    # if file is not exist, create it
-    if not os.path.exists(path):
-        with open(path, 'w', encoding='utf-8') as f:
-            pass
+    if path not in _active_lines:
+        _active_lines[path] = _count_lines(path) if os.path.exists(path) else 0
 
-    # first, read the len
-    with open(path, encoding='utf-8') as f:
-        lines = f.readlines()
-        if len(lines) > 12 * 30: # 30 minutes at 5s interval
-            # seperate to new file
-            timestamp = int(json.loads(lines[-1])['timestamp'])
+    timestamp = data[0].received_at
+    if _active_lines[path] > ROTATE_AFTER_LINES:
+        # Rotated name = int(last timestamp in the file); the new record is always later.
+        with open(path, 'rb') as f:
+            f.seek(max(0, os.fstat(f.fileno()).st_size - 4096))
+            last = f.read().splitlines()[-1]
+        os.rename(path, os.path.join(os.path.dirname(path), f'store_{int(json.loads(last)["timestamp"])}.jsonl'))
+        _active_lines[path] = 0
 
-            # rename
-            os.rename(path, f'./data/store_{timestamp}.jsonl')
-
-            # recreate
-            with open(path, 'w', encoding='utf-8') as f:
-                pass
-
+    json_line = json.dumps({
+        'sensor_report': data[0].snapshot(),
+        'reconciler_command': asdict(data[1]),
+        'timestamp': timestamp
+    }, ensure_ascii=False, allow_nan=False)
     with open(path, 'a', encoding='utf-8') as f:
-        json_line = json.dumps({
-            'sensor_report': data[0].snapshot(),
-            'reconciler_command': asdict(data[1]),
-            'timestamp': data[0].received_at
-        }, ensure_ascii=False, allow_nan=False)
         f.write(json_line + '\n')
+    _active_lines[path] += 1
 
 def list_segments(directory: str = './data') -> list[str]:
     """Return segment files ordered oldest -> newest.
