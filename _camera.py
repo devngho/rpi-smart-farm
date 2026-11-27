@@ -35,7 +35,7 @@ NIGHT_EXPOSURE = int(os.environ.get('SMART_FARM_CAMERA_NIGHT_EXPOSURE', '0'))
 NIGHT_WARMUP_FRAMES = 3  # manual exposure needs no convergence, just a couple of frames to apply
 NIGHT_FRAMES = 6
 NIGHT_TIMEOUT_S = 90  # long exposures run at ~1 fps
-NIGHT_MAX_GAIN = 10.0  # cap on the level stretch so pure noise isn't blown up to full contrast
+NIGHT_MAX_GAIN = 24.0  # cap on the level stretch so pure noise isn't blown up to full contrast
 NIGHT_FORMATS = ('yuyv422', 'mjpeg')  # first one the camera accepts is used
 
 _NAME = re.compile(r'(\d+)\.jpg')
@@ -139,14 +139,16 @@ class Controls:
     def night(self, exposure: int = NIGHT_EXPOSURE) -> str:
         """Manual long exposure and maximum gain. Returns a short description for the log."""
         done = []
+        # Without this the camera keeps its frame rate and silently clips any exposure to one
+        # frame period (~133 ms for YUYV 1280x720), which is no longer than auto exposure.
+        if self.set(CID_EXPOSURE_AUTO_PRIORITY, 1):
+            done.append('frame rate may drop')
         if self.set(CID_EXPOSURE_AUTO, EXPOSURE_MANUAL):
             q = self.query(CID_EXPOSURE_ABSOLUTE)
             if q is not None:
                 value = min(max(exposure or q[1], q[0]), q[1])
                 if self.set(CID_EXPOSURE_ABSOLUTE, value):
                     done.append(f'exposure {value / 10:g} ms')
-        elif self.set(CID_EXPOSURE_AUTO_PRIORITY, 1):
-            done.append('auto exposure may lower the frame rate')
         q = self.query(CID_GAIN)
         if q is not None and self.set(CID_GAIN, q[1]):
             done.append(f'gain {q[1]}')
@@ -225,8 +227,12 @@ async def _night_capture(device: str, out: str) -> dict:
             errors = []
             for fmt in NIGHT_FORMATS:
                 try:
+                    started = time.monotonic()
                     await _ffmpeg([*camera_input(device, fmt), '-vf', night_filter(),
                                    '-frames:v', '1', '-f', 'image2', '-y', out], NIGHT_TIMEOUT_S)
+                    # ~1 s per frame when the long exposure is really applied, ~0.1 s when clipped
+                    info['capture_s'] = round(time.monotonic() - started, 1)
+                    info['frames'] = NIGHT_WARMUP_FRAMES + NIGHT_FRAMES
                     info['input_format'] = fmt
                     return info
                 except RuntimeError as exc:  # e.g. format unsupported: try the next one
@@ -257,7 +263,14 @@ async def grab(path: str, device: str = DEVICE) -> dict:
     stacked, night = path + '.stack.png', path + '.night.jpg'  # PNG: no extra compression before the stretch
     try:
         info.update(await _night_capture(device, stacked))
-        info['levels'] = await stretch(stacked, night)
+        info['luma_stacked'] = round(await mean_luma(stacked), 1)
+        if info['luma_stacked'] <= info['luma']:
+            # the long exposure gathered no more light than auto exposure: brighten the normal shot
+            info['source'] = 'normal'
+            info['levels'] = await stretch(path, night)
+        else:
+            info['source'] = 'stacked'
+            info['levels'] = await stretch(stacked, night)
         info['luma_after'] = round(await mean_luma(night), 1)
         os.replace(night, path)
         info['night'] = True
@@ -291,23 +304,24 @@ async def take_snapshot(directory: str = SNAPSHOT_DIR, capture=grab) -> int:
     return ts
 
 
+MIN_GAP_S = 60  # don't take a boundary snapshot right after the startup one
+
+
+def _next_delay(interval_s: float, now: float) -> float:
+    """Seconds until the next interval boundary, skipping one that is less than MIN_GAP_S away."""
+    delay = interval_s - now % interval_s
+    return delay + interval_s if delay < min(MIN_GAP_S, interval_s / 2) else delay
+
+
 async def capture_task(directory: str = SNAPSHOT_DIR, interval_s: float = INTERVAL_S, capture=grab):
-    """Take a snapshot now (unless a recent one exists), then on every interval boundary."""
-    delay = 0.0
-    try:
-        stored = timestamps(directory)
-        if stored and 0 <= time.time() - stored[-1] < interval_s:
-            delay = interval_s - time.time() % interval_s
-    except OSError as exc:
-        print(f'Camera snapshot directory unavailable: {exc}')
+    """Take a snapshot right away (so a restart shows its effect at once), then on every interval boundary."""
     while True:
-        await asyncio.sleep(delay)
         try:
             await take_snapshot(directory, capture)
             await asyncio.to_thread(prune, time.time(), directory)
         except Exception as exc:  # unplugged camera, busy device, full disk... retry next time
             print(f'Camera snapshot failed: {exc!r}')
-        delay = interval_s - time.time() % interval_s
+        await asyncio.sleep(_next_delay(interval_s, time.time()))
 
 
 router = APIRouter(prefix='/camera')

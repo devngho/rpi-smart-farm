@@ -3,6 +3,7 @@ import asyncio
 import json
 import os
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -62,6 +63,9 @@ class CameraTests(unittest.TestCase):
         self.assertTrue(self.info['night'])
         self.assertEqual(self.info['controls'], 'no controls')  # no webcam here: stacking + levels still apply
         self.assertEqual(self.info['input_format'], 'yuyv422')
+        self.assertEqual(self.info['frames'], _camera.NIGHT_WARMUP_FRAMES + _camera.NIGHT_FRAMES)
+        self.assertGreaterEqual(self.info['capture_s'], 0)
+        self.assertIn(self.info['source'], ('stacked', 'normal'))
         self.assertLess(self.info['luma'], _camera.NIGHT_LUMA)
         self.assertGreater(self.luma(path), 60)
         self.assertAlmostEqual(self.info['luma_after'], self.luma(path), delta=1)
@@ -75,6 +79,16 @@ class CameraTests(unittest.TestCase):
         # same scene with a strong blue cast ends up with about the same colour balance
         for a, b in zip(neutral, cast):
             self.assertAlmostEqual(a, b, delta=15, msg=(neutral, cast))
+
+    def test_darker_long_exposure_falls_back_to_normal_frame(self):
+        # night retake darker than the auto-exposure shot, like the first real YUYV attempt
+        INPUTS['darker'] = ['-f', 'lavfi', '-i', 'testsrc2=s=1280x720:r=10,lutrgb=r=val*0.05:g=val*0.05:b=val*0.05']
+        self.addCleanup(INPUTS.pop, 'darker')
+        path, _ = self.grab('night', night_scene='darker')
+        self.assertTrue(self.info['night'])
+        self.assertLess(self.info['luma_stacked'], self.info['luma'])
+        self.assertEqual(self.info['source'], 'normal')
+        self.assertGreater(self.luma(path), self.info['luma'])
 
     def test_falls_back_to_mjpeg(self):
         path, _ = self.grab('night', failing_formats=('yuyv422',))
@@ -113,11 +127,12 @@ class CameraTests(unittest.TestCase):
                 return True
 
         path, log = self.grab('night', FakeControls)
-        self.assertEqual(self.info['controls'], 'exposure 204.7 ms, gain 255')
+        self.assertEqual(self.info['controls'], 'frame rate may drop, exposure 204.7 ms, gain 255')
         self.assertIn('exposure_time_absolute', self.info['readback'])
         night = calls.index((_camera.CID_EXPOSURE_AUTO, _camera.EXPOSURE_MANUAL))
         self.assertIn((_camera.CID_EXPOSURE_ABSOLUTE, 2047), calls[night:])
         self.assertIn((_camera.CID_GAIN, 255), calls[night:])
+        self.assertIn((_camera.CID_EXPOSURE_AUTO_PRIORITY, 1), calls[night - 1:])
         self.assertEqual(calls[-4:], [(_camera.CID_EXPOSURE_AUTO, 3), (_camera.CID_EXPOSURE_AUTO_PRIORITY, 0),
                                       (_camera.CID_GAIN, 0), (_camera.CID_EXPOSURE_ABSOLUTE, 250)])  # back to auto
 
@@ -137,6 +152,31 @@ class CameraTests(unittest.TestCase):
             path, log = self.grab('day')
         self.assertIn('brightness check failed', log)
         self.assertGreater(os.path.getsize(path), 0)
+
+    def test_snapshot_taken_right_after_launch(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        with open(os.path.join(tmp.name, f'{int(time.time()) - 5}.jpg'), 'wb') as f:
+            f.write(b'recent')  # a recent snapshot no longer delays the first one
+        shots = []
+
+        async def capture(path):
+            shots.append(time.time())
+            with open(path, 'wb') as f:
+                f.write(b'jpeg')
+
+        async def run():
+            task = asyncio.create_task(_camera.capture_task(tmp.name, 600, capture))
+            await asyncio.sleep(0.5)
+            task.cancel()
+
+        asyncio.run(run())
+        self.assertEqual(len(shots), 1)
+        self.assertEqual(len(_camera.timestamps(tmp.name)), 2)
+
+    def test_next_delay_skips_boundary_right_after_startup_shot(self):
+        self.assertEqual(_camera._next_delay(600, 1200 + 100), 500)
+        self.assertEqual(_camera._next_delay(600, 1200 + 570), 630)  # 30 s to the boundary: skip it
 
     def test_controls_without_device(self):
         with patch('builtins.print'), _camera.Controls('/nonexistent') as ctl:
