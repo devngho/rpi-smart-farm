@@ -3,6 +3,7 @@ import asyncio
 import json
 import os
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -151,6 +152,31 @@ class CameraTests(unittest.TestCase):
             path, log = self.grab('day')
         self.assertIn('brightness check failed', log)
         self.assertGreater(os.path.getsize(path), 0)
+
+    def test_snapshot_taken_right_after_launch(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        with open(os.path.join(tmp.name, f'{int(time.time()) - 5}.jpg'), 'wb') as f:
+            f.write(b'recent')  # a recent snapshot no longer delays the first one
+        shots = []
+
+        async def capture(path):
+            shots.append(time.time())
+            with open(path, 'wb') as f:
+                f.write(b'jpeg')
+
+        async def run():
+            task = asyncio.create_task(_camera.capture_task(tmp.name, 600, capture))
+            await asyncio.sleep(0.5)
+            task.cancel()
+
+        asyncio.run(run())
+        self.assertEqual(len(shots), 1)
+        self.assertEqual(len(_camera.timestamps(tmp.name)), 2)
+
+    def test_next_delay_skips_boundary_right_after_startup_shot(self):
+        self.assertEqual(_camera._next_delay(600, 1200 + 100), 500)
+        self.assertEqual(_camera._next_delay(600, 1200 + 570), 630)  # 30 s to the boundary: skip it
 
     def test_controls_without_device(self):
         with patch('builtins.print'), _camera.Controls('/nonexistent') as ctl:

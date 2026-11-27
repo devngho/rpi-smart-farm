@@ -304,23 +304,24 @@ async def take_snapshot(directory: str = SNAPSHOT_DIR, capture=grab) -> int:
     return ts
 
 
+MIN_GAP_S = 60  # don't take a boundary snapshot right after the startup one
+
+
+def _next_delay(interval_s: float, now: float) -> float:
+    """Seconds until the next interval boundary, skipping one that is less than MIN_GAP_S away."""
+    delay = interval_s - now % interval_s
+    return delay + interval_s if delay < min(MIN_GAP_S, interval_s / 2) else delay
+
+
 async def capture_task(directory: str = SNAPSHOT_DIR, interval_s: float = INTERVAL_S, capture=grab):
-    """Take a snapshot now (unless a recent one exists), then on every interval boundary."""
-    delay = 0.0
-    try:
-        stored = timestamps(directory)
-        if stored and 0 <= time.time() - stored[-1] < interval_s:
-            delay = interval_s - time.time() % interval_s
-    except OSError as exc:
-        print(f'Camera snapshot directory unavailable: {exc}')
+    """Take a snapshot right away (so a restart shows its effect at once), then on every interval boundary."""
     while True:
-        await asyncio.sleep(delay)
         try:
             await take_snapshot(directory, capture)
             await asyncio.to_thread(prune, time.time(), directory)
         except Exception as exc:  # unplugged camera, busy device, full disk... retry next time
             print(f'Camera snapshot failed: {exc!r}')
-        delay = interval_s - time.time() % interval_s
+        await asyncio.sleep(_next_delay(interval_s, time.time()))
 
 
 router = APIRouter(prefix='/camera')
