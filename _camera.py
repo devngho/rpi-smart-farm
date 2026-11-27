@@ -24,18 +24,20 @@ RETENTION_S = float(os.environ.get('SMART_FARM_CAMERA_RETENTION_DAYS', '30')) * 
 TIMEOUT_S = 40
 WARMUP_FRAMES = 30  # auto exposure / white balance need a moment after the stream starts
 
-# Night mode: when a normal snapshot is darker than NIGHT_LUMA (mean luma, 0-255), retake it
-# with manual long exposure + max gain from uncompressed YUYV frames (MJPEG's 8x8 blocks turn
-# into posterized tiles once brightened), average NIGHT_FRAMES frames to cut sensor noise,
-# denoise and stretch each colour channel's levels. Daylight snapshots measure ~50-100,
-# night ones ~13. What happened is saved next to the JPEG as <ts>.json (GET .../info).
+# Night mode: when a normal snapshot is darker than NIGHT_LUMA (mean luma, 0-255), take
+# NIGHT_GROUPS x NIGHT_GROUP_FRAMES more frames, average them at 16 bits per channel (sensor
+# noise drops ~sqrt(48) = 7x), denoise and stretch each colour channel's levels.
+# The camera stays in auto exposure: the C270 accepts manual exposure values but only honours a
+# few discrete ones, and its manual mode came out far darker than auto (21:33 test: luma 0.4 vs
+# 7.2). It may only lower its frame rate so auto exposure can run longer.
+# Daylight snapshots measure ~50-100, night ones ~7-13. What happened is saved next to the JPEG
+# as <ts>.json (GET .../info).
 NIGHT_LUMA = float(os.environ.get('SMART_FARM_CAMERA_NIGHT_LUMA', '35'))  # 0 disables night mode
-# Exposure in 100 µs units (V4L2 exposure_time_absolute); default: the camera's maximum.
-NIGHT_EXPOSURE = int(os.environ.get('SMART_FARM_CAMERA_NIGHT_EXPOSURE', '0'))
-NIGHT_WARMUP_FRAMES = 3  # manual exposure needs no convergence, just a couple of frames to apply
-NIGHT_FRAMES = 6
-NIGHT_TIMEOUT_S = 90  # long exposures run at ~1 fps
-NIGHT_MAX_GAIN = 24.0  # cap on the level stretch so pure noise isn't blown up to full contrast
+NIGHT_WARMUP_FRAMES = 15  # auto exposure settles after the frame-rate change
+NIGHT_GROUP_FRAMES = 8    # averaged in two stages (8 x 6) so ffmpeg's cost stays linear
+NIGHT_GROUPS = 6
+NIGHT_TIMEOUT_S = 120     # 63 frames at the low frame rates auto exposure picks in the dark
+NIGHT_MAX_GAIN = 12.0     # cap on the level stretch so the remaining noise isn't blown up
 NIGHT_FORMATS = ('yuyv422', 'mjpeg')  # first one the camera accepts is used
 
 _NAME = re.compile(r'(\d+)\.jpg')
@@ -136,23 +138,9 @@ class Controls:
             if q is not None:
                 self.set(cid, q[2])
 
-    def night(self, exposure: int = NIGHT_EXPOSURE) -> str:
-        """Manual long exposure and maximum gain. Returns a short description for the log."""
-        done = []
-        # Without this the camera keeps its frame rate and silently clips any exposure to one
-        # frame period (~133 ms for YUYV 1280x720), which is no longer than auto exposure.
-        if self.set(CID_EXPOSURE_AUTO_PRIORITY, 1):
-            done.append('frame rate may drop')
-        if self.set(CID_EXPOSURE_AUTO, EXPOSURE_MANUAL):
-            q = self.query(CID_EXPOSURE_ABSOLUTE)
-            if q is not None:
-                value = min(max(exposure or q[1], q[0]), q[1])
-                if self.set(CID_EXPOSURE_ABSOLUTE, value):
-                    done.append(f'exposure {value / 10:g} ms')
-        q = self.query(CID_GAIN)
-        if q is not None and self.set(CID_GAIN, q[1]):
-            done.append(f'gain {q[1]}')
-        return ', '.join(done) or 'no controls'
+    def night(self) -> str:
+        """Let auto exposure lower the frame rate (longer exposures). Returns a short description."""
+        return 'frame rate may drop' if self.set(CID_EXPOSURE_AUTO_PRIORITY, 1) else 'no controls'
 
     def readback(self) -> dict:
         """Current values as the camera reports them (None = unavailable), for diagnostics."""
@@ -181,10 +169,15 @@ def camera_input(device: str = DEVICE, input_format: str = 'mjpeg') -> list[str]
     return ['-f', 'v4l2', '-input_format', input_format, '-video_size', '1280x720', '-i', device]
 
 
-def night_filter(warmup: int = NIGHT_WARMUP_FRAMES, frames: int = NIGHT_FRAMES) -> str:
-    """Average `frames` frames after `warmup` (sensor noise drops ~sqrt(frames)), then denoise."""
-    return (f'select=gte(n\\,{warmup}),tmix=frames={frames},select=gte(n\\,{frames - 1}),'
-            'hqdn3d=3:2:3:2')
+def night_filter(warmup: int = NIGHT_WARMUP_FRAMES, group: int = NIGHT_GROUP_FRAMES,
+                 groups: int = NIGHT_GROUPS) -> str:
+    """Average group*groups frames after `warmup` at 16 bits per channel, then denoise.
+
+    Two stages (means of `group` frames, then the mean of `groups` of those) because tmix
+    re-mixes its whole window for every frame; one 48-frame window would cost 48x more."""
+    return (f'select=gte(n\\,{warmup}),format=gbrp16le,'
+            f'tmix=frames={group},select=eq(mod(n\\,{group})\\,{group - 1}),'
+            f'tmix=frames={groups},select=gte(n\\,{groups - 1}),hqdn3d=4:3:4:3')
 
 
 async def _pixels(path: str, size: str, fmt: str) -> bytes:
@@ -212,7 +205,8 @@ async def stretch(src: str, dst: str, low_pct: float = 1.0, high_pct: float = 99
         lo = ch[int(len(ch) * low_pct / 100)]
         hi = ch[min(len(ch) - 1, int(len(ch) * high_pct / 100))]
         levels[name] = (lo, max(hi, lo + 255 / max_gain))
-    exprs = ':'.join(f"{c}='255*pow(clip((val-{lo})/{hi - lo:.2f}\\,0\\,1)\\,{gamma})'"
+    # levels are in 8-bit units; `maxval` makes the same curve work on 16-bit stacks (no banding)
+    exprs = ':'.join(f"{c}='maxval*pow(clip((val*255/maxval-{lo})/{hi - lo:.2f}\\,0\\,1)\\,{gamma})'"
                      for c, (lo, hi) in levels.items())
     await _ffmpeg(['-i', src, '-vf', f'lutrgb={exprs}', '-q:v', '3', '-f', 'image2', '-y', dst], 30)
     return {c: [lo, round(hi, 1)] for c, (lo, hi) in levels.items()}
@@ -230,9 +224,9 @@ async def _night_capture(device: str, out: str) -> dict:
                     started = time.monotonic()
                     await _ffmpeg([*camera_input(device, fmt), '-vf', night_filter(),
                                    '-frames:v', '1', '-f', 'image2', '-y', out], NIGHT_TIMEOUT_S)
-                    # ~1 s per frame when the long exposure is really applied, ~0.1 s when clipped
+                    # longer per frame when auto exposure lowers the frame rate
                     info['capture_s'] = round(time.monotonic() - started, 1)
-                    info['frames'] = NIGHT_WARMUP_FRAMES + NIGHT_FRAMES
+                    info['frames'] = NIGHT_WARMUP_FRAMES + NIGHT_GROUP_FRAMES * NIGHT_GROUPS
                     info['input_format'] = fmt
                     return info
                 except RuntimeError as exc:  # e.g. format unsupported: try the next one
@@ -260,12 +254,12 @@ async def grab(path: str, device: str = DEVICE) -> dict:
         return info
     if info['luma'] >= NIGHT_LUMA:
         return info
-    stacked, night = path + '.stack.png', path + '.night.jpg'  # PNG: no extra compression before the stretch
+    stacked, night = path + '.stack.png', path + '.night.jpg'  # 16-bit PNG: no compression or banding
     try:
         info.update(await _night_capture(device, stacked))
         info['luma_stacked'] = round(await mean_luma(stacked), 1)
-        if info['luma_stacked'] <= info['luma']:
-            # the long exposure gathered no more light than auto exposure: brighten the normal shot
+        if info['luma_stacked'] < 0.7 * info['luma']:
+            # the stack came out clearly darker than the normal shot: brighten that instead
             info['source'] = 'normal'
             info['levels'] = await stretch(path, night)
         else:
