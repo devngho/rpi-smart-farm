@@ -23,10 +23,11 @@ DATA_DIR = './data'
 ACTIVE_NAME = 'store.jsonl'
 
 SENSOR_COLUMNS = ('moisture', 'temp_inner', 'humd_inner', 'temp_outer', 'humd_outer', 'illumination')
-COMMAND_COLUMNS = ('pump_level', 'peltier_level', 'peltier_forward', 'fan_level')
+COMMAND_COLUMNS = ('pump_level', 'peltier_level', 'peltier_forward', 'fan_level', 'temp_estimated')
 COLUMNS = SENSOR_COLUMNS + COMMAND_COLUMNS
 DIGITS = {'moisture': 1, 'temp_inner': 2, 'temp_outer': 2, 'humd_inner': 2, 'humd_outer': 2,
-          'illumination': 1, 'pump_level': 1, 'peltier_level': 1, 'peltier_forward': 2, 'fan_level': 1}
+          'illumination': 1, 'pump_level': 1, 'peltier_level': 1, 'peltier_forward': 2, 'fan_level': 1,
+          'temp_estimated': 2}
 
 ROLLUP_LEVELS = (60, 900)
 # Bucket sizes are multiples of the rollup levels and aligned to the epoch, so
@@ -69,9 +70,11 @@ def _row(line: str):
         fan = _num(cmd.get('fan_level'))
         if _isnan(fan) and not _isnan(peltier):
             fan = 1023.0 if peltier >= 64 else 0.0  # ReconcilerCommand.fan_level is derived
-        vals += [_num(cmd.get('pump_level')), peltier, _num(cmd.get('peltier_forward')), fan]
+        # inner temperature estimated from the outer sensor while the inner sensor was down
+        est = _num(cmd.get('control_temp')) if cmd.get('temp_source') == 'estimated' else NAN
+        vals += [_num(cmd.get('pump_level')), peltier, _num(cmd.get('peltier_forward')), fan, est]
     else:
-        vals += [NAN] * 4
+        vals += [NAN] * len(COMMAND_COLUMNS)
     return ts, vals
 
 

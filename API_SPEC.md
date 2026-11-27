@@ -226,7 +226,8 @@ Arduino 기반 센서 시스템의 REST API 및 WebSocket 명세입니다.
 | `series` | 컬럼별 값 (버킷 평균). 수신 시점에 유효하지 않았던 값, 단위를 알 수 없는 레거시 습도, 조도 센서 없음(-1)은 `null` |
 
 컬럼: `moisture`, `temp_inner`, `humd_inner`, `temp_outer`, `humd_outer`, `illumination`,
-`pump_level`, `peltier_level`, `peltier_forward`, `fan_level` (`fan_level`은 `peltier_level`에서 유도).
+`pump_level`, `peltier_level`, `peltier_forward`, `fan_level` (`fan_level`은 `peltier_level`에서 유도),
+`temp_estimated` (내부 센서 장애 중 외부 센서로 추정한 내부 온도, 그 외에는 `null`).
 
 ---
 
@@ -391,6 +392,25 @@ POST /control/set?pump_level=512&peltier_level=256&peltier_forward=1
 
 ---
 
+## 🌡️ 내부 온도 센서 장애 처리
+
+내부 온도(`temp_inner`)가 유효하지 않을 때:
+
+1. **유지 (`held`)**: 마지막 유효값 이후 `inner_hold_s`(기본 60초) 동안은 그 값으로 계속 제어합니다.
+   기록상 끊김의 93%가 60초 이내입니다.
+2. **추정 (`estimated`)**: 이후 `fallback_max_s`(기본 4시간) 동안 외부 온도로 내부 온도를 추정해 제어하며,
+   Peltier 출력은 `fallback_max_level`(기본 512)로 제한됩니다.
+   `추정 = 외부 + bias + fallback_heater_gain × (Peltier 듀티의 1차 지연, 가열 +1)`
+   - 기본값은 4.6일치 기록으로 맞춤: 가열 꺼짐 시 내부가 외부보다 ~0.7°C 높고(`fallback_prior_bias`),
+     최대 가열 시 ~4.5°C 추가(`fallback_heater_gain`), 지연 ~6분(`fallback_heater_tau`).
+   - `bias`는 내부 센서가 정상일 때 계속 학습(`fallback_bias_tau` 5분)하며, prior ± `fallback_bias_limit`(2°C)로 제한.
+   - 기록으로 검증한 추정 오차(평균 / 95%): 15분 0.14 / 0.44°C, 1시간 0.23 / 0.76°C, 4시간 0.48 / 1.09°C.
+3. **끄기 (`none`)**: 그 이후 또는 외부 센서도 없으면 Peltier를 끕니다 (기존 동작).
+
+`inner_hold_s`, `fallback_max_s`를 `0`으로 두면 기존처럼 즉시 끕니다 (`config.json`).
+
+---
+
 ## 🔌 WebSocket API
 
 ### `WS /live`
@@ -425,6 +445,13 @@ POST /control/set?pump_level=512&peltier_level=256&peltier_forward=1
   }
 }
 ```
+
+`command`에는 Peltier 명령의 근거 온도도 포함됩니다:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `temp_source` | `"inner" \| "held" \| "estimated" \| "none"` | 내부 센서 / 짧은 끊김 동안 마지막 내부값 유지 / 외부 센서 기반 추정 / 없음(Peltier 꺼짐) |
+| `control_temp` | `float \| null` | 제어에 사용한 온도 (°C) |
 
 **Update Frequency**: ~1초 간격 (데이터 변경 시)
 

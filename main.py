@@ -5,7 +5,7 @@ import math
 import os
 import time
 from contextlib import asynccontextmanager, suppress
-from dataclasses import asdict
+from dataclasses import asdict, replace
 
 import uvicorn
 from fastapi import FastAPI, WebSocket
@@ -63,13 +63,14 @@ async def control(link: PacketConnection, records: asyncio.Queue):
             await link.send(0, 0)
             pump_until = None
             if last_command:
-                last_command = ReconcilerCommand(0, last_command.peltier_level, last_command.peltier_forward)
+                last_command = replace(last_command, pump_level=0)
         if previous is not None and now - previous >= reconciler_config.sensor_timeout_s:
             if last_command and (last_command.peltier_level or last_command.pump_level):
                 await link.stop()
                 last_command = ReconcilerCommand(0, 0, 1)
             pump_until = previous = None
-            reconciler_state = ReconcilerState()  # don't blend stale inputs into recovery
+            # don't blend stale inputs into recovery (the inner-temperature estimator is kept)
+            reconciler_state = reconciler_state.reset()
         if report is None:
             continue
         deadline = report.received_monotonic + reconciler_config.sensor_timeout_s
@@ -88,6 +89,7 @@ async def control(link: PacketConnection, records: asyncio.Queue):
             # A newer sample (possibly a sensor fault) arrived during calculation.
             # Record this sample but only energize outputs from the newest one.
             command = ReconcilerCommand(0, 0, 1)
+            reconciler_state.estimator.applied(0, 1, reconciler_config.cooling_direction)
         await link.send(0, command.pump_level)
         if not command.pump_level:
             pump_until = None
@@ -114,7 +116,7 @@ async def read_task(port: str, records: asyncio.Queue):
             print(f'USB serial connection lost: {exc.exceptions}')
         finally:
             last_report = last_command = None
-            reconciler_state = ReconcilerState()
+            reconciler_state = reconciler_state.reset()
         await asyncio.sleep(2)
 
 @asynccontextmanager
