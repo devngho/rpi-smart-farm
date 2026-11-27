@@ -62,6 +62,9 @@ class CameraTests(unittest.TestCase):
         self.assertTrue(self.info['night'])
         self.assertEqual(self.info['controls'], 'no controls')  # no webcam here: stacking + levels still apply
         self.assertEqual(self.info['input_format'], 'yuyv422')
+        self.assertEqual(self.info['frames'], _camera.NIGHT_WARMUP_FRAMES + _camera.NIGHT_FRAMES)
+        self.assertGreaterEqual(self.info['capture_s'], 0)
+        self.assertIn(self.info['source'], ('stacked', 'normal'))
         self.assertLess(self.info['luma'], _camera.NIGHT_LUMA)
         self.assertGreater(self.luma(path), 60)
         self.assertAlmostEqual(self.info['luma_after'], self.luma(path), delta=1)
@@ -75,6 +78,16 @@ class CameraTests(unittest.TestCase):
         # same scene with a strong blue cast ends up with about the same colour balance
         for a, b in zip(neutral, cast):
             self.assertAlmostEqual(a, b, delta=15, msg=(neutral, cast))
+
+    def test_darker_long_exposure_falls_back_to_normal_frame(self):
+        # night retake darker than the auto-exposure shot, like the first real YUYV attempt
+        INPUTS['darker'] = ['-f', 'lavfi', '-i', 'testsrc2=s=1280x720:r=10,lutrgb=r=val*0.05:g=val*0.05:b=val*0.05']
+        self.addCleanup(INPUTS.pop, 'darker')
+        path, _ = self.grab('night', night_scene='darker')
+        self.assertTrue(self.info['night'])
+        self.assertLess(self.info['luma_stacked'], self.info['luma'])
+        self.assertEqual(self.info['source'], 'normal')
+        self.assertGreater(self.luma(path), self.info['luma'])
 
     def test_falls_back_to_mjpeg(self):
         path, _ = self.grab('night', failing_formats=('yuyv422',))
@@ -113,11 +126,12 @@ class CameraTests(unittest.TestCase):
                 return True
 
         path, log = self.grab('night', FakeControls)
-        self.assertEqual(self.info['controls'], 'exposure 204.7 ms, gain 255')
+        self.assertEqual(self.info['controls'], 'frame rate may drop, exposure 204.7 ms, gain 255')
         self.assertIn('exposure_time_absolute', self.info['readback'])
         night = calls.index((_camera.CID_EXPOSURE_AUTO, _camera.EXPOSURE_MANUAL))
         self.assertIn((_camera.CID_EXPOSURE_ABSOLUTE, 2047), calls[night:])
         self.assertIn((_camera.CID_GAIN, 255), calls[night:])
+        self.assertIn((_camera.CID_EXPOSURE_AUTO_PRIORITY, 1), calls[night - 1:])
         self.assertEqual(calls[-4:], [(_camera.CID_EXPOSURE_AUTO, 3), (_camera.CID_EXPOSURE_AUTO_PRIORITY, 0),
                                       (_camera.CID_GAIN, 0), (_camera.CID_EXPOSURE_ABSOLUTE, 250)])  # back to auto
 
