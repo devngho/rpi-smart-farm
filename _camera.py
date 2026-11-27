@@ -6,6 +6,7 @@ Files are `<unix seconds>.jpg`; ones older than the retention period are deleted
 """
 import asyncio
 import fcntl
+import json
 import os
 import re
 import struct
@@ -24,14 +25,18 @@ TIMEOUT_S = 40
 WARMUP_FRAMES = 30  # auto exposure / white balance need a moment after the stream starts
 
 # Night mode: when a normal snapshot is darker than NIGHT_LUMA (mean luma, 0-255), retake it
-# with manual long exposure + max gain, average NIGHT_FRAMES frames to cut sensor noise,
-# denoise and stretch the levels. Daylight snapshots measure ~50-100, night ones ~15.
+# with manual long exposure + max gain from uncompressed YUYV frames (MJPEG's 8x8 blocks turn
+# into posterized tiles once brightened), average NIGHT_FRAMES frames to cut sensor noise,
+# denoise and stretch each colour channel's levels. Daylight snapshots measure ~50-100,
+# night ones ~13. What happened is saved next to the JPEG as <ts>.json (GET .../info).
 NIGHT_LUMA = float(os.environ.get('SMART_FARM_CAMERA_NIGHT_LUMA', '35'))  # 0 disables night mode
 # Exposure in 100 µs units (V4L2 exposure_time_absolute); default: the camera's maximum.
 NIGHT_EXPOSURE = int(os.environ.get('SMART_FARM_CAMERA_NIGHT_EXPOSURE', '0'))
 NIGHT_WARMUP_FRAMES = 3  # manual exposure needs no convergence, just a couple of frames to apply
 NIGHT_FRAMES = 6
 NIGHT_TIMEOUT_S = 90  # long exposures run at ~1 fps
+NIGHT_MAX_GAIN = 10.0  # cap on the level stretch so pure noise isn't blown up to full contrast
+NIGHT_FORMATS = ('yuyv422', 'mjpeg')  # first one the camera accepts is used
 
 _NAME = re.compile(r'(\d+)\.jpg')
 
@@ -45,13 +50,18 @@ def timestamps(directory: str = SNAPSHOT_DIR) -> list[int]:
     return sorted(int(m[1]) for m in map(_NAME.fullmatch, names) if m)
 
 
+def _info_path(ts: int, directory: str = SNAPSHOT_DIR) -> str:
+    return os.path.join(directory, f'{ts}.json')
+
+
 def prune(now: float, directory: str = SNAPSHOT_DIR, retention_s: float = RETENTION_S) -> None:
     if retention_s <= 0:
         return
     for ts in timestamps(directory):
         if ts < now - retention_s:
-            with suppress(FileNotFoundError):
-                os.remove(os.path.join(directory, f'{ts}.jpg'))
+            for path in (os.path.join(directory, f'{ts}.jpg'), _info_path(ts, directory)):
+                with suppress(FileNotFoundError):
+                    os.remove(path)
 
 
 # ---- V4L2 camera controls (plain ioctls, no v4l-utils needed) ----
@@ -100,6 +110,16 @@ class Controls:
         _, _, _, lo, hi, _, default, _ = _QUERYCTRL.unpack(buf)
         return lo, hi, default
 
+    def get(self, cid: int) -> int | None:
+        if self.fd is None:
+            return None
+        buf = bytearray(_CTRL.pack(cid, 0))
+        try:
+            fcntl.ioctl(self.fd, VIDIOC_G_CTRL, buf)
+        except OSError:
+            return None
+        return _CTRL.unpack(buf)[1]
+
     def set(self, cid: int, value: int) -> bool:
         if self.fd is None:
             return False
@@ -132,6 +152,12 @@ class Controls:
             done.append(f'gain {q[1]}')
         return ', '.join(done) or 'no controls'
 
+    def readback(self) -> dict:
+        """Current values as the camera reports them (None = unavailable), for diagnostics."""
+        return {name: self.get(cid) for name, cid in (
+            ('auto_exposure', CID_EXPOSURE_AUTO), ('exposure_time_absolute', CID_EXPOSURE_ABSOLUTE),
+            ('exposure_dynamic_framerate', CID_EXPOSURE_AUTO_PRIORITY), ('gain', CID_GAIN))}
+
 
 # ---- capture ----
 async def _ffmpeg(args: list[str], timeout: float) -> bytes:
@@ -149,8 +175,8 @@ async def _ffmpeg(args: list[str], timeout: float) -> bytes:
     return out
 
 
-def camera_input(device: str = DEVICE) -> list[str]:
-    return ['-f', 'v4l2', '-input_format', 'mjpeg', '-video_size', '1280x720', '-i', device]
+def camera_input(device: str = DEVICE, input_format: str = 'mjpeg') -> list[str]:
+    return ['-f', 'v4l2', '-input_format', input_format, '-video_size', '1280x720', '-i', device]
 
 
 def night_filter(warmup: int = NIGHT_WARMUP_FRAMES, frames: int = NIGHT_FRAMES) -> str:
@@ -159,61 +185,91 @@ def night_filter(warmup: int = NIGHT_WARMUP_FRAMES, frames: int = NIGHT_FRAMES) 
             'hqdn3d=3:2:3:2')
 
 
-async def _gray(path: str, size: str = '160x90') -> bytes:
-    """Downscaled 8-bit grey pixels of a JPEG (via ffmpeg; no image libraries needed)."""
-    return await _ffmpeg(['-i', path, '-vf', f'scale={size},format=gray', '-f', 'rawvideo', '-'], 15)
+async def _pixels(path: str, size: str, fmt: str) -> bytes:
+    """Downscaled 8-bit pixels of an image (via ffmpeg; no image libraries needed)."""
+    return await _ffmpeg(['-i', path, '-vf', f'scale={size},format={fmt}', '-f', 'rawvideo', '-'], 15)
 
 
 async def mean_luma(path: str) -> float:
     """Average brightness 0-255."""
-    raw = await _gray(path, '64x36')
+    raw = await _pixels(path, '64x36', 'gray')
     return sum(raw) / len(raw) if raw else 0.0
 
 
-async def stretch(src: str, dst: str, low_pct: float = 1.0, high_pct: float = 99.5, gamma: float = 0.8) -> None:
-    """Map the low/high brightness percentiles to black/white (same for R, G, B), with mild gamma.
-    Percentiles rather than min/max, so a few bright LEDs in view don't cancel the stretch."""
-    raw = sorted(await _gray(src))
-    lo = raw[int(len(raw) * low_pct / 100)]
-    hi = max(raw[min(len(raw) - 1, int(len(raw) * high_pct / 100))], lo + 8)
-    expr = f"'255*pow(clip((val-{lo})/{hi - lo}\\,0\\,1)\\,{gamma})'"
-    await _ffmpeg(['-i', src, '-vf', f'lutrgb=r={expr}:g={expr}:b={expr}',
-                   '-q:v', '4', '-f', 'image2', '-y', dst], 30)
+async def stretch(src: str, dst: str, low_pct: float = 1.0, high_pct: float = 99.5, gamma: float = 0.8,
+                  max_gain: float = NIGHT_MAX_GAIN) -> dict:
+    """Map each channel's low/high percentiles to black/white, with mild gamma.
+
+    Per channel, because in the dark the channels' black levels and sensitivities differ a
+    lot (one shared stretch gave a strong blue cast); percentiles rather than min/max, so a
+    few bright LEDs in view don't cancel the stretch. Returns the levels used."""
+    raw = await _pixels(src, '160x90', 'rgb24')
+    levels = {}
+    for i, name in enumerate('rgb'):
+        ch = sorted(raw[i::3])
+        lo = ch[int(len(ch) * low_pct / 100)]
+        hi = ch[min(len(ch) - 1, int(len(ch) * high_pct / 100))]
+        levels[name] = (lo, max(hi, lo + 255 / max_gain))
+    exprs = ':'.join(f"{c}='255*pow(clip((val-{lo})/{hi - lo:.2f}\\,0\\,1)\\,{gamma})'"
+                     for c, (lo, hi) in levels.items())
+    await _ffmpeg(['-i', src, '-vf', f'lutrgb={exprs}', '-q:v', '3', '-f', 'image2', '-y', dst], 30)
+    return {c: [lo, round(hi, 1)] for c, (lo, hi) in levels.items()}
 
 
-async def grab(path: str, device: str = DEVICE) -> None:
-    """Write one JPEG from the webcam to `path`; retake dark (night) frames with long exposure."""
+async def _night_capture(device: str, out: str) -> dict:
+    """Long-exposure, frame-averaged, losslessly stored capture; the camera is set back to auto after."""
+    with Controls(device) as ctl:
+        try:
+            info = {'controls': ctl.night()}
+            info['readback'] = ctl.readback()
+            errors = []
+            for fmt in NIGHT_FORMATS:
+                try:
+                    await _ffmpeg([*camera_input(device, fmt), '-vf', night_filter(),
+                                   '-frames:v', '1', '-f', 'image2', '-y', out], NIGHT_TIMEOUT_S)
+                    info['input_format'] = fmt
+                    return info
+                except RuntimeError as exc:  # e.g. format unsupported: try the next one
+                    errors.append(f'{fmt}: {exc}')
+            raise RuntimeError('; '.join(errors))
+        finally:
+            ctl.reset()
+
+
+async def grab(path: str, device: str = DEVICE) -> dict:
+    """Write one JPEG from the webcam to `path`; retake dark (night) frames with long exposure.
+    Returns what happened (saved as the snapshot's info)."""
     with Controls(device) as ctl:
         ctl.reset()  # never start from a manual exposure left behind by an interrupted night capture
     await _ffmpeg([*camera_input(device), '-vf', f'select=gte(n\\,{WARMUP_FRAMES})',
                    '-frames:v', '1', '-q:v', '4', '-f', 'image2', '-y', path], TIMEOUT_S)
+    info: dict = {'night': False}
     if NIGHT_LUMA <= 0:
-        return
+        return info
     try:
-        luma = await mean_luma(path)
+        info['luma'] = round(await mean_luma(path), 1)
     except Exception as exc:  # night mode is best effort: never lose the normal snapshot
         print(f'Camera brightness check failed, keeping the normal snapshot: {exc!r}')
-        return
-    if luma >= NIGHT_LUMA:
-        return
-    stacked, night = path + '.stack.jpg', path + '.night.jpg'
+        info['error'] = f'brightness check: {exc!r}'
+        return info
+    if info['luma'] >= NIGHT_LUMA:
+        return info
+    stacked, night = path + '.stack.png', path + '.night.jpg'  # PNG: no extra compression before the stretch
     try:
-        with Controls(device) as ctl:
-            try:
-                how = ctl.night()
-                await _ffmpeg([*camera_input(device), '-vf', night_filter(),
-                               '-frames:v', '1', '-q:v', '2', '-f', 'image2', '-y', stacked], NIGHT_TIMEOUT_S)
-            finally:
-                ctl.reset()
-        await stretch(stacked, night)
+        info.update(await _night_capture(device, stacked))
+        info['levels'] = await stretch(stacked, night)
+        info['luma_after'] = round(await mean_luma(night), 1)
         os.replace(night, path)
-        print(f'Camera night capture (mean luma {luma:.0f}): {how}')
+        info['night'] = True
+        print(f'Camera night capture: {info}')
     except Exception as exc:  # keep the normal (dark) snapshot
         print(f'Camera night capture failed, keeping the normal snapshot: {exc!r}')
+        info['error'] = f'night capture: {exc!r}'
     finally:
         for tmp in (stacked, night):
             with suppress(FileNotFoundError):
                 os.remove(tmp)
+    return info
 
 
 async def take_snapshot(directory: str = SNAPSHOT_DIR, capture=grab) -> int:
@@ -222,9 +278,12 @@ async def take_snapshot(directory: str = SNAPSHOT_DIR, capture=grab) -> int:
     path = os.path.join(directory, f'{ts}.jpg')
     tmp = path + '.tmp'
     try:
-        await capture(tmp)
+        info = await capture(tmp)
         if not os.path.getsize(tmp):
             raise RuntimeError('empty snapshot')
+        if isinstance(info, dict):
+            with suppress(OSError, TypeError, ValueError), open(_info_path(ts, directory), 'w') as f:
+                json.dump(info, f)
         os.replace(tmp, path)  # the API never sees a half-written file
     finally:
         with suppress(FileNotFoundError):
@@ -281,3 +340,13 @@ async def latest_snapshot():
 async def get_snapshot(ts: int):
     """지정한 시각의 스냅샷 JPEG"""
     return _jpeg(ts, 'max-age=86400')
+
+
+@router.get('/snapshots/{ts}/info')
+async def get_snapshot_info(ts: int):
+    """스냅샷 촬영 정보 (밝기, 야간 모드 적용 여부, 노출/게인 값 등)"""
+    try:
+        with open(_info_path(ts), encoding='utf-8') as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return JSONResponse(status_code=404, content={'error': 'No info for this snapshot'})

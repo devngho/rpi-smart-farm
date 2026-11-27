@@ -1,5 +1,6 @@
 """Camera night mode, with ffmpeg reading synthetic frames instead of a webcam."""
 import asyncio
+import json
 import os
 import tempfile
 import unittest
@@ -11,15 +12,26 @@ INPUTS = {
     'day': ['-f', 'lavfi', '-i', 'testsrc2=s=1280x720:r=10'],
     # dim scene + strong per-frame sensor noise, like the C270 at night
     'night': ['-f', 'lavfi', '-i', 'testsrc2=s=1280x720:r=10,eq=brightness=-0.42,noise=alls=20:allf=t'],
+    # dim scene with a strong blue cast (blue lifted, green crushed), like the first night-mode result
+    'night_cast': ['-f', 'lavfi', '-i', 'testsrc2=s=1280x720:r=10,eq=brightness=-0.42,'
+                   'lutrgb=r=val*0.6:g=val*0.3:b=val*0.9+25,noise=alls=10:allf=t'],
 }
 
 
 class CameraTests(unittest.TestCase):
-    def grab(self, scene, controls=None):
+    def grab(self, scene, controls=None, night_scene=None, failing_formats=()):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         path = os.path.join(tmp.name, '1.jpg.tmp')
-        patches = [patch.object(_camera, 'camera_input', lambda device=None: INPUTS[scene]),
+        self.formats = []
+
+        def camera_input(device=None, input_format='mjpeg'):
+            self.formats.append(input_format)
+            if input_format in failing_formats:
+                return ['-f', 'lavfi', '-i', 'nonexistent_source']
+            return INPUTS[night_scene if night_scene and len(self.formats) > 1 else scene]
+
+        patches = [patch.object(_camera, 'camera_input', camera_input),
                    patch.object(_camera, 'WARMUP_FRAMES', 1)]
         if controls is not None:
             patches.append(patch.object(_camera, 'Controls', controls))
@@ -27,9 +39,13 @@ class CameraTests(unittest.TestCase):
             p.start()
             self.addCleanup(p.stop)
         with patch('builtins.print') as log:
-            asyncio.run(_camera.grab(path, device='/nonexistent'))
+            self.info = asyncio.run(_camera.grab(path, device='/nonexistent'))
         self.assertEqual(sorted(os.listdir(tmp.name)), ['1.jpg.tmp'])  # no temp files left behind
         return path, ' '.join(str(c) for c in log.call_args_list)
+
+    def channel_means(self, path):
+        raw = asyncio.run(_camera._pixels(path, '64x36', 'rgb24'))
+        return [sum(raw[i::3]) / (len(raw) / 3) for i in range(3)]
 
     def luma(self, path):
         return asyncio.run(_camera.mean_luma(path))
@@ -38,12 +54,48 @@ class CameraTests(unittest.TestCase):
         path, log = self.grab('day')
         self.assertGreater(self.luma(path), _camera.NIGHT_LUMA)
         self.assertNotIn('night capture', log)
+        self.assertEqual(self.info['night'], False)
+        self.assertGreater(self.info['luma'], _camera.NIGHT_LUMA)
 
     def test_dark_snapshot_is_retaken_brighter(self):
         path, log = self.grab('night')
-        self.assertIn('Camera night capture (mean luma', log)
-        self.assertIn('no controls', log)  # no webcam here: stacking + levels still apply
+        self.assertTrue(self.info['night'])
+        self.assertEqual(self.info['controls'], 'no controls')  # no webcam here: stacking + levels still apply
+        self.assertEqual(self.info['input_format'], 'yuyv422')
+        self.assertLess(self.info['luma'], _camera.NIGHT_LUMA)
         self.assertGreater(self.luma(path), 60)
+        self.assertAlmostEqual(self.info['luma_after'], self.luma(path), delta=1)
+
+    def test_colour_cast_removed(self):
+        path, _ = self.grab('night')
+        neutral = self.channel_means(path)
+        path, _ = self.grab('night_cast')
+        self.assertTrue(self.info['night'])
+        cast = self.channel_means(path)
+        # same scene with a strong blue cast ends up with about the same colour balance
+        for a, b in zip(neutral, cast):
+            self.assertAlmostEqual(a, b, delta=15, msg=(neutral, cast))
+
+    def test_falls_back_to_mjpeg(self):
+        path, _ = self.grab('night', failing_formats=('yuyv422',))
+        self.assertTrue(self.info['night'])
+        self.assertEqual(self.info['input_format'], 'mjpeg')
+        self.assertEqual(self.formats, ['mjpeg', 'yuyv422', 'mjpeg'])
+
+    def test_snapshot_info_saved_and_pruned(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+
+        async def capture(path):
+            with open(path, 'wb') as f:
+                f.write(b'jpeg')
+            return {'night': True, 'luma': 12.5}
+
+        ts = asyncio.run(_camera.take_snapshot(tmp.name, capture))
+        with open(os.path.join(tmp.name, f'{ts}.json')) as f:
+            self.assertEqual(json.load(f), {'night': True, 'luma': 12.5})
+        _camera.prune(ts + 10, tmp.name, retention_s=5)
+        self.assertEqual(os.listdir(tmp.name), [])
 
     def test_controls_set_and_restored(self):
         calls = []
@@ -61,7 +113,8 @@ class CameraTests(unittest.TestCase):
                 return True
 
         path, log = self.grab('night', FakeControls)
-        self.assertIn('exposure 204.7 ms, gain 255', log)
+        self.assertEqual(self.info['controls'], 'exposure 204.7 ms, gain 255')
+        self.assertIn('exposure_time_absolute', self.info['readback'])
         night = calls.index((_camera.CID_EXPOSURE_AUTO, _camera.EXPOSURE_MANUAL))
         self.assertIn((_camera.CID_EXPOSURE_ABSOLUTE, 2047), calls[night:])
         self.assertIn((_camera.CID_GAIN, 255), calls[night:])
@@ -72,6 +125,8 @@ class CameraTests(unittest.TestCase):
         with patch.object(_camera, 'night_filter', lambda: 'nonexistent_filter'):
             path, log = self.grab('night')
         self.assertIn('night capture failed', log)
+        self.assertFalse(self.info['night'])
+        self.assertIn('night capture', self.info['error'])
         self.assertLess(self.luma(path), _camera.NIGHT_LUMA)
 
     def test_brightness_check_failure_keeps_normal_snapshot(self):
