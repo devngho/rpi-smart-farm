@@ -2,7 +2,7 @@ import json
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from datetime import time as dt_time
-from math import isfinite
+from math import exp, isfinite
 from pathlib import Path
 
 from _packet import SensorReport
@@ -20,11 +20,25 @@ class ReconcilerConfig:
 
     sensor_timeout_s: float = 15.0
 
+    # Inner temperature sensor dropouts:
+    # 1) up to `inner_hold_s` after the last valid inner reading, keep controlling on that reading;
+    # 2) after that, estimate the inner temperature from the outer sensor for at most
+    #    `fallback_max_s` (0 disables) with the Peltier capped at `fallback_max_level`;
+    # 3) then switch the Peltier off until the inner sensor recovers.
+    inner_hold_s: float = 60.0
+    fallback_max_s: float = 4 * 3600.0
+    fallback_max_level: int = 512
+
     def __post_init__(self):
         if not isfinite(self.sensor_timeout_s) or self.sensor_timeout_s <= 0:
             raise ValueError('sensor_timeout_s must be finite and positive')
         if type(self.cooling_direction) is not int or self.cooling_direction not in (0, 1):
             raise ValueError('cooling_direction must be 0 or 1')
+        if not (isfinite(self.inner_hold_s) and self.inner_hold_s >= 0
+                and isfinite(self.fallback_max_s) and self.fallback_max_s >= 0):
+            raise ValueError('inner_hold_s and fallback_max_s must be finite and >= 0')
+        if not 0 <= self.fallback_max_level <= 1023:
+            raise ValueError('fallback_max_level must be within 0..1023')
 
 @dataclass
 class ReconcilerTune:
@@ -51,6 +65,19 @@ class ReconcilerTune:
     der_tau: float = 1.0              # s (low-pass on derivative)
     aw_limit: float = 2.0             # limit on integral contribution (Ki*I) in output units
 
+    # Inner temperature estimate from the outer sensor:
+    #   inner ~= outer + bias + heater_gain * lagged signed Peltier duty (+1 = full heating)
+    # Defaults fitted on 4.6 days of farm history: heater off -> inner ~0.7 C above outer,
+    # full heating adds ~4.5 C with a ~6 min lag. `bias` is re-learned online while the inner
+    # sensor works (time constant fallback_bias_tau); the prior is used until then.
+    fallback_heater_gain: float = 4.5   # °C per full-scale duty
+    fallback_heater_tau: float = 360.0  # s
+    fallback_bias_tau: float = 300.0    # s
+    fallback_prior_bias: float = 0.7    # °C
+    # The learned bias is kept within prior ± this (history: 5th-95th percentile -0.5..2.6 °C),
+    # so readings from a failing sensor (e.g. condensation right before it dies) can't skew it far.
+    fallback_bias_limit: float = 2.0    # °C
+
 def load_settings[T: (ReconcilerConfig, ReconcilerTune)](filename: str, defaults: T, *, create=False) -> T:
     path = Path(filename)
     try:
@@ -68,10 +95,71 @@ class ReconcilerCommand:
     pump_level: int      # 0-1023
     peltier_level: int   # 0-1023
     peltier_forward: int # 0 or 1
+    # Which temperature the Peltier command was based on:
+    # 'inner' | 'held' (last valid inner, short dropout) | 'estimated' (outer sensor) | 'none' (off)
+    temp_source: str = 'none'
+    control_temp: float | None = None  # °C value the controller used (unfiltered)
 
     @property
     def fan_level(self) -> int:
         return 1023 if self.peltier_level >= 64 else 0
+
+@dataclass
+class InnerEstimator:
+    """Tracks what is needed to stand in for the inner sensor. Uses wall-clock seconds so it
+    can survive ReconcilerState resets (sensor timeouts, USB reconnects)."""
+    last_inner: float | None = None
+    last_inner_at: float | None = None
+    bias: float | None = None          # learned inner - outer - gain*duty_lag
+    duty_lag: float = 0.0              # first-order lag of the applied signed Peltier duty
+    last_duty: float = 0.0             # signed duty currently applied (+ heating)
+    last_at: float | None = None
+    outage_since: float | None = None  # first report without a valid inner reading
+    estimate: float | None = None
+
+    def observe(self, report: SensorReport, config: 'ReconcilerConfig', tune: 'ReconcilerTune') -> None:
+        now = report.received_at
+        if self.last_at is not None and now > self.last_at:
+            gap = now - self.last_at
+            duty = self.last_duty if gap <= config.sensor_timeout_s else 0.0  # outputs were stopped
+            tau = max(tune.fallback_heater_tau, 1e-6)
+            self.duty_lag += (1 - exp(-gap / tau)) * (duty - self.duty_lag)
+        else:
+            gap = 0.0
+        self.last_at = now
+        if report.temp_inner is not None:
+            self.last_inner, self.last_inner_at, self.outage_since = report.temp_inner, now, None
+            if report.temp_outer is not None:
+                x = report.temp_inner - report.temp_outer - tune.fallback_heater_gain * self.duty_lag
+                if self.bias is None:
+                    self.bias = x
+                else:
+                    self.bias += (1 - exp(-gap / max(tune.fallback_bias_tau, 1e-6))) * (x - self.bias)
+                lo = tune.fallback_prior_bias - tune.fallback_bias_limit
+                self.bias = min(max(self.bias, lo), lo + 2 * tune.fallback_bias_limit)
+        elif self.outage_since is None:
+            self.outage_since = now if self.last_inner_at is None else self.last_inner_at
+        self.estimate = None
+        if report.temp_outer is not None:
+            bias = self.bias if self.bias is not None else tune.fallback_prior_bias
+            self.estimate = report.temp_outer + bias + tune.fallback_heater_gain * self.duty_lag
+
+    def applied(self, peltier_level: int, peltier_forward: int, cooling_direction: int) -> None:
+        """Record the Peltier output actually sent (heating positive)."""
+        sign = 1.0 if peltier_forward == 1 - cooling_direction else -1.0
+        self.last_duty = sign * peltier_level / 1023
+
+    def source(self, report: SensorReport, config: 'ReconcilerConfig') -> tuple[str, float | None]:
+        if report.temp_inner is not None:
+            return 'inner', report.temp_inner
+        now = report.received_at
+        if self.last_inner_at is not None and now - self.last_inner_at <= config.inner_hold_s:
+            return 'held', self.last_inner
+        since = self.outage_since if self.outage_since is not None else now
+        if self.estimate is not None and now - since < config.fallback_max_s:
+            return 'estimated', self.estimate
+        return 'none', None
+
 
 @dataclass
 class ReconcilerState:
@@ -90,6 +178,13 @@ class ReconcilerState:
     filt_temp: float | None = None
     der_moist: float = 0.0
     der_temp: float = 0.0
+
+    temp_source: str = 'none'
+    estimator: InnerEstimator = field(default_factory=InnerEstimator)
+
+    def reset(self) -> 'ReconcilerState':
+        """Fresh controller state that keeps what the inner-temperature estimator has learned."""
+        return ReconcilerState(estimator=self.estimator)
 
 # ---------- helpers ----------
 def _clamp(v: float, lo: float, hi: float) -> float:
@@ -173,13 +268,18 @@ def reconcile_sensor_data(
         pump_level = 0
 
     # ---- 2) Temperature (Peltier) PID ----
-    if report.temp_inner is None:
+    est = state.estimator
+    est.observe(report, config, tune)
+    source, temp = est.source(report, config)
+    state.temp_source = source
+    if temp is None:
         state.temp_ema.clear()
         state.filt_temp = None
         state.integral_temp = state.last_temp_error = state.der_temp = 0.0
-        return state, ReconcilerCommand(pump_level, 0, 0)
+        est.applied(0, 0, config.cooling_direction)
+        return state, ReconcilerCommand(pump_level, 0, 0, 'none', None)
 
-    temp_sma = report.temp_inner
+    temp_sma = temp
     if tune.temp_ema_count > 0:
         state.temp_ema.append(temp_sma)
         if len(state.temp_ema) > tune.temp_ema_count:
@@ -216,11 +316,16 @@ def reconcile_sensor_data(
 
     peltier_forward = 1 - config.cooling_direction if peltier_u >= 0 else config.cooling_direction
     peltier_level = int(round(abs(peltier_u)))
+    if source == 'estimated':
+        peltier_level = min(peltier_level, config.fallback_max_level)
     if peltier_level < tune.cutoff:
         peltier_level = 0
 
+    est.applied(peltier_level, peltier_forward, config.cooling_direction)
     return state, ReconcilerCommand(
         pump_level=pump_level,
         peltier_level=peltier_level,
-        peltier_forward=peltier_forward
+        peltier_forward=peltier_forward,
+        temp_source=source,
+        control_temp=round(temp, 2),
     )

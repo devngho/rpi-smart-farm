@@ -117,6 +117,11 @@ class USBTests(unittest.IsolatedAsyncioTestCase):
                     os.close(master)
 
     async def test_session(self):
+        # This test covers the fail-safe path: no hold, no outer-sensor fallback.
+        for key in ('inner_hold_s', 'fallback_max_s'):
+            patcher = patch.object(main.reconciler_config, key, 0.0)
+            patcher.start()
+            self.addCleanup(patcher.stop)
         master, slave = pty.openpty()
         self.addCleanup(os.close, slave)
         self.addCleanup(os.close, master)
