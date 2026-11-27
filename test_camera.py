@@ -74,6 +74,15 @@ class CameraTests(unittest.TestCase):
         self.assertIn('night capture failed', log)
         self.assertLess(self.luma(path), _camera.NIGHT_LUMA)
 
+    def test_brightness_check_failure_keeps_normal_snapshot(self):
+        async def broken(path):
+            raise TimeoutError
+
+        with patch.object(_camera, 'mean_luma', broken):
+            path, log = self.grab('day')
+        self.assertIn('brightness check failed', log)
+        self.assertGreater(os.path.getsize(path), 0)
+
     def test_controls_without_device(self):
         with patch('builtins.print'), _camera.Controls('/nonexistent') as ctl:
             self.assertIsNone(ctl.query(_camera.CID_GAIN))

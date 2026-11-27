@@ -189,7 +189,11 @@ async def grab(path: str, device: str = DEVICE) -> None:
                    '-frames:v', '1', '-q:v', '4', '-f', 'image2', '-y', path], TIMEOUT_S)
     if NIGHT_LUMA <= 0:
         return
-    luma = await mean_luma(path)
+    try:
+        luma = await mean_luma(path)
+    except Exception as exc:  # night mode is best effort: never lose the normal snapshot
+        print(f'Camera brightness check failed, keeping the normal snapshot: {exc!r}')
+        return
     if luma >= NIGHT_LUMA:
         return
     stacked, night = path + '.stack.jpg', path + '.night.jpg'
