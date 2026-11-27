@@ -13,6 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse, Response
 
+import _camera
 from _history import store as history_store
 from _illumination import read_light
 from _packet import PacketConnection, SensorReport, open_link
@@ -130,12 +131,14 @@ async def lifespan(app: FastAPI):
         history_task = tasks.create_task(record_reports(records))
         # Parse recent history once up front so the dashboard's first chart load is fast.
         warm_task = tasks.create_task(asyncio.to_thread(history_store.query, None, None, 1000))
+        camera_task = tasks.create_task(_camera.capture_task())
         try:
             yield
         finally:
             serial_task.cancel()
             history_task.cancel()
             warm_task.cancel()
+            camera_task.cancel()
 
 app = FastAPI(lifespan=lifespan)
 
@@ -149,6 +152,8 @@ app.add_middleware(
 )
 
 app.add_middleware(GZipMiddleware, minimum_size=1000)
+
+app.include_router(_camera.router)
 
 @app.get("/sensor/latest")
 async def get_latest_sensor():
