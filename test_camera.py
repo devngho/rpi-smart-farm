@@ -33,7 +33,8 @@ class CameraTests(unittest.TestCase):
             return INPUTS[night_scene if night_scene and len(self.formats) > 1 else scene]
 
         patches = [patch.object(_camera, 'camera_input', camera_input),
-                   patch.object(_camera, 'WARMUP_FRAMES', 1)]
+                   patch.object(_camera, 'WARMUP_FRAMES', 1),
+                   patch.object(_camera, 'NIGHT_STAGES', (8, 6))]  # fewer frames keep these tests fast
         if controls is not None:
             patches.append(patch.object(_camera, 'Controls', controls))
         for p in patches:
@@ -63,7 +64,7 @@ class CameraTests(unittest.TestCase):
         self.assertTrue(self.info['night'])
         self.assertEqual(self.info['controls'], 'no controls')  # no webcam here: stacking + levels still apply
         self.assertEqual(self.info['input_format'], 'yuyv422')
-        self.assertEqual(self.info['frames'], _camera.NIGHT_WARMUP_FRAMES + _camera.NIGHT_GROUP_FRAMES * _camera.NIGHT_GROUPS)
+        self.assertEqual(self.info['frames'], _camera.NIGHT_WARMUP_FRAMES + _camera.night_frames())
         self.assertGreaterEqual(self.info['capture_s'], 0)
         self.assertIn(self.info['source'], ('stacked', 'normal'))
         self.assertLess(self.info['luma'], _camera.NIGHT_LUMA)
@@ -106,25 +107,30 @@ class CameraTests(unittest.TestCase):
         self.assertGreater(self.luma(path), self.info['luma'])
 
     def test_stacking_reduces_noise(self):
-        # same dim scene, heavy per-frame noise: the 48-frame stack must be much smoother than one frame
+        # same dim scene, heavy per-frame noise: noise must fall with the number of frames stacked
         INPUTS['noisy'] = ['-f', 'lavfi', '-i', 'color=c=0x303030:s=1280x720:r=30,noise=alls=40:allf=t']
         self.addCleanup(INPUTS.pop, 'noisy')
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        single, stacked = os.path.join(tmp.name, 'single.png'), os.path.join(tmp.name, 'stacked.png')
 
-        async def run():
-            await _camera._ffmpeg([*INPUTS['noisy'], '-frames:v', '1', '-y', single], 30)
-            await _camera._ffmpeg([*INPUTS['noisy'], '-vf', _camera.night_filter(), '-frames:v', '1',
-                                   '-y', stacked], 60)
-            return [await _camera._pixels(p, '320x180', 'gray') for p in (single, stacked)]
-
-        def spread(px):
+        async def spread(vf, name):
+            out = os.path.join(tmp.name, name)
+            await _camera._ffmpeg([*INPUTS['noisy'], '-vf', vf, '-frames:v', '1', '-y', out], 60)
+            # full resolution, 16-bit grey: no downscaling or 8-bit rounding hiding the noise
+            raw = await _camera._ffmpeg(['-i', out, '-vf', 'format=gray16le', '-f', 'rawvideo', '-'], 30)
+            px = [int.from_bytes(raw[i:i + 2], 'little') / 257 for i in range(0, len(raw), 2 * 7)]
             mean = sum(px) / len(px)
             return (sum((v - mean) ** 2 for v in px) / len(px)) ** 0.5
 
-        one, many = asyncio.run(run())
-        self.assertLess(spread(many), spread(one) / 4)
+        async def run():
+            return (await spread('select=gte(n\\,15),format=gbrp16le', 'one.png'),
+                    await spread(_camera.night_filter(stages=(8, 6)), 'n48.png'),
+                    await spread(_camera.night_filter(), 'n192.png'))
+
+        one, n48, n192 = asyncio.run(run())
+        self.assertEqual(_camera.night_frames(), 192)
+        self.assertLess(n192, one / 8, (one, n48, n192))   # ~13x in theory
+        self.assertLess(n192, n48 * 0.8, (one, n48, n192))  # more frames still help
 
     def test_white_balance_ignores_coloured_wires(self):
         # night frame: shadows at the sensor's black level (red offset 6), grey soil/walls under

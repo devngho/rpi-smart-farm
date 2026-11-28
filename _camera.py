@@ -7,6 +7,7 @@ Files are `<unix seconds>.jpg`; ones older than the retention period are deleted
 import asyncio
 import fcntl
 import json
+import math
 import os
 import re
 import struct
@@ -25,8 +26,10 @@ TIMEOUT_S = 40
 WARMUP_FRAMES = 30  # auto exposure / white balance need a moment after the stream starts
 
 # Night mode: when a normal snapshot is darker than NIGHT_LUMA (mean luma, 0-255), take
-# NIGHT_GROUPS x NIGHT_GROUP_FRAMES more frames, average them at 16 bits per channel (sensor
-# noise drops ~sqrt(48) = 7x), denoise and stretch each colour channel's levels.
+# prod(NIGHT_STAGES) more frames and average them at 16 bits per channel; random sensor noise
+# drops ~sqrt(frames) (measured: 48 frames 6.8x, 192 frames 13x). The camera and scene are
+# static, so more frames only cost capture time (~5-6 fps at night: 192 frames ~35 s).
+# Then white-balance, stretch and sharpen.
 # The camera stays in auto exposure: the C270 accepts manual exposure values but only honours a
 # few discrete ones, and its manual mode came out far darker than auto (21:33 test: luma 0.4 vs
 # 7.2). It may only lower its frame rate so auto exposure can run longer.
@@ -34,9 +37,11 @@ WARMUP_FRAMES = 30  # auto exposure / white balance need a moment after the stre
 # as <ts>.json (GET .../info).
 NIGHT_LUMA = float(os.environ.get('SMART_FARM_CAMERA_NIGHT_LUMA', '35'))  # 0 disables night mode
 NIGHT_WARMUP_FRAMES = 15  # auto exposure settles after the frame-rate change
-NIGHT_GROUP_FRAMES = 8    # averaged in two stages (8 x 6) so ffmpeg's cost stays linear
-NIGHT_GROUPS = 6
-NIGHT_TIMEOUT_S = 120     # 63 frames at the low frame rates auto exposure picks in the dark
+# Averaged in stages (means of 8, then means of 8 of those, then of 3): tmix re-mixes its
+# whole window for every frame, so one 192-frame window would cost ~25x more CPU and hold
+# 192 16-bit frames (~1 GB) in memory; staged, at most ~19 frames (~100 MB).
+NIGHT_STAGES = tuple(int(n) for n in os.environ.get('SMART_FARM_CAMERA_NIGHT_STAGES', '8,8,3').split(','))
+NIGHT_TIMEOUT_S = 180     # 207 frames at the low frame rates auto exposure picks in the dark
 NIGHT_MAX_GAIN = 12.0     # cap on the level stretch so the remaining noise isn't blown up
 NIGHT_FORMATS = ('yuyv422', 'mjpeg')  # first one the camera accepts is used
 
@@ -169,15 +174,24 @@ def camera_input(device: str = DEVICE, input_format: str = 'mjpeg') -> list[str]
     return ['-f', 'v4l2', '-input_format', input_format, '-video_size', '1280x720', '-i', device]
 
 
-def night_filter(warmup: int = NIGHT_WARMUP_FRAMES, group: int = NIGHT_GROUP_FRAMES,
-                 groups: int = NIGHT_GROUPS) -> str:
-    """Average group*groups frames after `warmup` at 16 bits per channel, then denoise.
+def night_frames(stages: tuple[int, ...] | None = None) -> int:
+    return math.prod(stages or NIGHT_STAGES)
 
-    Two stages (means of `group` frames, then the mean of `groups` of those) because tmix
-    re-mixes its whole window for every frame; one 48-frame window would cost 48x more."""
-    return (f'select=gte(n\\,{warmup}),format=gbrp16le,'
-            f'tmix=frames={group},select=eq(mod(n\\,{group})\\,{group - 1}),'
-            f'tmix=frames={groups},select=gte(n\\,{groups - 1}),hqdn3d=2:1.5:3:3')  # light: stacking already removed most noise, keep detail
+
+def night_filter(warmup: int = NIGHT_WARMUP_FRAMES, stages: tuple[int, ...] | None = None) -> str:
+    """Average prod(stages) frames after `warmup` at 16 bits per channel, then denoise lightly.
+
+    Each stage averages `n` of the previous stage's outputs and keeps every n-th result, so
+    CPU stays linear in the frame count and memory bounded by sum(stages) frames."""
+    stages = stages or NIGHT_STAGES
+    chain = [f'select=gte(n\\,{warmup})', 'format=gbrp16le']
+    for i, n in enumerate(stages):
+        chain.append(f'tmix=frames={n}')
+        # keep only complete windows; after the last stage, the first complete one is the result
+        chain.append(f'select=gte(n\\,{n - 1})' if i == len(stages) - 1
+                     else f'select=eq(mod(n\\,{n})\\,{n - 1})')
+    chain.append('hqdn3d=2:1.5:3:3')  # light: stacking already removed most noise, keep detail
+    return ','.join(chain)
 
 
 async def _pixels(path: str, size: str, fmt: str) -> bytes:
@@ -271,7 +285,7 @@ async def _night_capture(device: str, out: str) -> dict:
                                    '-frames:v', '1', '-f', 'image2', '-y', out], NIGHT_TIMEOUT_S)
                     # longer per frame when auto exposure lowers the frame rate
                     info['capture_s'] = round(time.monotonic() - started, 1)
-                    info['frames'] = NIGHT_WARMUP_FRAMES + NIGHT_GROUP_FRAMES * NIGHT_GROUPS
+                    info['frames'] = NIGHT_WARMUP_FRAMES + night_frames()
                     info['input_format'] = fmt
                     return info
                 except RuntimeError as exc:  # e.g. format unsupported: try the next one
