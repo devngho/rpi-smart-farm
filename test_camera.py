@@ -71,14 +71,29 @@ class CameraTests(unittest.TestCase):
         self.assertAlmostEqual(self.info['luma_after'], self.luma(path), delta=1)
 
     def test_colour_cast_removed(self):
-        path, _ = self.grab('night')
-        neutral = self.channel_means(path)
-        path, _ = self.grab('night_cast')
-        self.assertTrue(self.info['night'])
-        cast = self.channel_means(path)
-        # same scene with a strong blue cast ends up with about the same colour balance
-        for a, b in zip(neutral, cast):
-            self.assertAlmostEqual(a, b, delta=15, msg=(neutral, cast))
+        # grey box with orange/yellow "wires", dark, with per-frame noise; then the same under a strong blue cast
+        scene = ('color=c=0x808080:s=1280x720:r=10,'
+                 'drawbox=x=100:y=0:w=80:h=720:color=0xff8000:t=fill,'
+                 'drawbox=x=400:y=0:w=60:h=720:color=0xffd000:t=fill,'
+                 'drawbox=x=900:y=0:w=40:h=720:color=0xd02020:t=fill,'
+                 'drawbox=x=0:y=620:w=1280:h=100:color=0x000000:t=fill,')  # shadows / black breadboard
+        INPUTS['grey_scene'] = ['-f', 'lavfi', '-i', scene + 'lutrgb=r=val*0.1:g=val*0.1:b=val*0.1,noise=alls=6:allf=t']
+        INPUTS['grey_scene_cast'] = ['-f', 'lavfi', '-i',
+                                     scene + 'lutrgb=r=val*0.06:g=val*0.05:b=val*0.12+6,noise=alls=6:allf=t']
+        self.addCleanup(INPUTS.pop, 'grey_scene')
+        self.addCleanup(INPUTS.pop, 'grey_scene_cast')
+        results = []
+        for name in ('grey_scene', 'grey_scene_cast'):
+            path, _ = self.grab(name)
+            self.assertTrue(self.info['night'])
+            raw = asyncio.run(_camera._pixels(path, '128x72', 'rgb24'))
+            # background column band x = 70%..85% of the width is plain grey in the scene
+            bg = [raw[(y * 128 + x) * 3:(y * 128 + x) * 3 + 3] for y in range(55) for x in range(96, 108)]
+            results.append([sum(p[i] for p in bg) / len(bg) for i in range(3)])
+        for r, g, b in results:
+            self.assertLess(max(r, g, b) - min(r, g, b), 20, results)  # background stays neutral
+        for a, b in zip(*results):
+            self.assertAlmostEqual(a, b, delta=20, msg=results)  # and the cast makes little difference
 
     def test_darker_long_exposure_falls_back_to_normal_frame(self):
         # night retake darker than the auto-exposure shot, like the first real YUYV attempt
@@ -110,6 +125,18 @@ class CameraTests(unittest.TestCase):
 
         one, many = asyncio.run(run())
         self.assertLess(spread(many), spread(one) / 4)
+
+    def test_white_balance_ignores_coloured_wires(self):
+        # night frame: shadows at the sensor's black level (red offset 6), grey soil/walls under
+        # a reddish cast (R:G:B = 4:2:1), and as many saturated orange/yellow wire pixels
+        shadows = [(6, 0, 0)] * 100
+        grey = [(6 + 4 * v, 2 * v, v) for v in range(2, 22)] * 30
+        wires = [(96, 40, 8), (90, 80, 6)] * 300
+        black, gains = _camera.white_balance(shadows + grey + wires)
+        self.assertEqual(black, [6, 0, 0])
+        for p in grey[:20]:  # every grey level comes out neutral
+            q = [(p[i] - black[i]) * gains[i] for i in range(3)]
+            self.assertLess(max(q) - min(q), 0.1 * sum(q) / 3 + 0.5, (q, gains))
 
     def test_falls_back_to_mjpeg(self):
         path, _ = self.grab('night', failing_formats=('yuyv422',))

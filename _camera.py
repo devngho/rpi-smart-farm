@@ -177,7 +177,7 @@ def night_filter(warmup: int = NIGHT_WARMUP_FRAMES, group: int = NIGHT_GROUP_FRA
     re-mixes its whole window for every frame; one 48-frame window would cost 48x more."""
     return (f'select=gte(n\\,{warmup}),format=gbrp16le,'
             f'tmix=frames={group},select=eq(mod(n\\,{group})\\,{group - 1}),'
-            f'tmix=frames={groups},select=gte(n\\,{groups - 1}),hqdn3d=4:3:4:3')
+            f'tmix=frames={groups},select=gte(n\\,{groups - 1}),hqdn3d=2:1.5:3:3')  # light: stacking already removed most noise, keep detail
 
 
 async def _pixels(path: str, size: str, fmt: str) -> bytes:
@@ -191,25 +191,70 @@ async def mean_luma(path: str) -> float:
     return sum(raw) / len(raw) if raw else 0.0
 
 
-async def stretch(src: str, dst: str, low_pct: float = 1.0, high_pct: float = 99.5, gamma: float = 0.8,
-                  max_gain: float = NIGHT_MAX_GAIN) -> dict:
-    """Map each channel's low/high percentiles to black/white, with mild gamma.
+def _pct(values, pct: float) -> float:
+    v = sorted(values)
+    return v[min(len(v) - 1, int(len(v) * pct / 100))]
 
-    Per channel, because in the dark the channels' black levels and sensitivities differ a
-    lot (one shared stretch gave a strong blue cast); percentiles rather than min/max, so a
-    few bright LEDs in view don't cancel the stretch. Returns the levels used."""
+
+def white_balance(px: list[tuple[int, int, int]], grey_tol: float = 0.3, rounds: int = 8,
+                  bin_size: float = 0.025):
+    """(black, gains) for 8-bit RGB pixels: per-channel black points (the darkest shadows),
+    then gains that make the scene's dominant colour (soil, perlite, walls) neutral.
+
+    Plain grey-world (all pixels) is pulled off by the many orange/yellow wires, and stretching
+    each channel to its own white point boosted blue's midtones (blue cast). So: find the most
+    common chromaticity among lit pixels (2-D histogram of r/sum, g/sum, smoothed 3x3), take it
+    as grey, then refine on pixels whose balanced colour is within `grey_tol`."""
+    black = [_pct([p[i] for p in px], 0.5) for i in range(3)]
+    x = [[max(0.0, p[i] - black[i]) for i in range(3)] for p in px]
+    lit = [q for q in x if sum(q) > 6]
+    if len(lit) < 20:
+        return black, [1.0, 1.0, 1.0]
+    hist: dict[tuple[int, int], list] = {}
+    for q in lit:
+        t = sum(q)
+        hist.setdefault((int(q[0] / t / bin_size), int(q[1] / t / bin_size)), []).append(q)
+    density = {k: sum(len(hist.get((k[0] + i, k[1] + j), ())) for i in (-1, 0, 1) for j in (-1, 0, 1))
+               for k in hist}
+    peak = max(density, key=density.get)
+    mode = [q for i in (-1, 0, 1) for j in (-1, 0, 1) for q in hist.get((peak[0] + i, peak[1] + j), ())]
+
+    def neutralise(sample):
+        means = [max(sum(q[i] for q in sample) / len(sample), 1e-3) for i in range(3)]
+        return [sum(means) / 3 / m for m in means]
+
+    gains = neutralise(mode)
+    for _ in range(rounds):
+        grey = []
+        for q in lit:
+            bal = [q[i] * gains[i] for i in range(3)]
+            if max(bal) - min(bal) < grey_tol * sum(bal) / 3:
+                grey.append(q)
+        if len(grey) < len(lit) // 50:  # too few neutral pixels to trust: keep the current gains
+            break
+        gains = neutralise(grey)
+    return black, [min(max(g, 1 / 3), 3.0) for g in gains]
+
+
+async def stretch(src: str, dst: str, high_pct: float = 99.5, gamma: float = 0.85,
+                  max_gain: float = NIGHT_MAX_GAIN, saturation: float = 1.15, sharpen: float = 0.8) -> dict:
+    """Colour-balance and brighten a dark frame, then sharpen it.
+
+    Black point per channel, gains from `white_balance`, one shared white point (the
+    `high_pct` brightness percentile, so a few bright LEDs in view don't cancel the stretch),
+    mild gamma; then a saturation boost and a luma-only unsharp mask (chroma noise untouched).
+    Measured in 8-bit units; `maxval` applies the same curve to 16-bit stacks (no banding)."""
     raw = await _pixels(src, '160x90', 'rgb24')
-    levels = {}
-    for i, name in enumerate('rgb'):
-        ch = sorted(raw[i::3])
-        lo = ch[int(len(ch) * low_pct / 100)]
-        hi = ch[min(len(ch) - 1, int(len(ch) * high_pct / 100))]
-        levels[name] = (lo, max(hi, lo + 255 / max_gain))
-    # levels are in 8-bit units; `maxval` makes the same curve work on 16-bit stacks (no banding)
-    exprs = ':'.join(f"{c}='maxval*pow(clip((val*255/maxval-{lo})/{hi - lo:.2f}\\,0\\,1)\\,{gamma})'"
-                     for c, (lo, hi) in levels.items())
-    await _ffmpeg(['-i', src, '-vf', f'lutrgb={exprs}', '-q:v', '3', '-f', 'image2', '-y', dst], 30)
-    return {c: [lo, round(hi, 1)] for c, (lo, hi) in levels.items()}
+    px = [tuple(raw[i:i + 3]) for i in range(0, len(raw) - 2, 3)]
+    black, gains = white_balance(px)
+    balanced = [sum(max(0.0, p[i] - black[i]) * gains[i] for i in range(3)) / 3 for p in px]
+    white = max(_pct(balanced, high_pct), 255 / max_gain)
+    exprs = ':'.join(
+        f"{c}='maxval*pow(clip((val*255/maxval-{black[i]})*{gains[i] / white:.5f}\\,0\\,1)\\,{gamma})'"
+        for i, c in enumerate('rgb'))
+    vf = f'lutrgb={exprs},eq=saturation={saturation},unsharp=5:5:{sharpen}:5:5:0'
+    await _ffmpeg(['-i', src, '-vf', vf, '-q:v', '3', '-f', 'image2', '-y', dst], 30)
+    return {'black': black, 'gains': [round(g, 3) for g in gains], 'white': round(white, 1)}
 
 
 async def _night_capture(device: str, out: str) -> dict:
