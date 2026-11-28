@@ -63,7 +63,7 @@ class CameraTests(unittest.TestCase):
         self.assertTrue(self.info['night'])
         self.assertEqual(self.info['controls'], 'no controls')  # no webcam here: stacking + levels still apply
         self.assertEqual(self.info['input_format'], 'yuyv422')
-        self.assertEqual(self.info['frames'], _camera.NIGHT_WARMUP_FRAMES + _camera.NIGHT_FRAMES)
+        self.assertEqual(self.info['frames'], _camera.NIGHT_WARMUP_FRAMES + _camera.NIGHT_GROUP_FRAMES * _camera.NIGHT_GROUPS)
         self.assertGreaterEqual(self.info['capture_s'], 0)
         self.assertIn(self.info['source'], ('stacked', 'normal'))
         self.assertLess(self.info['luma'], _camera.NIGHT_LUMA)
@@ -89,6 +89,27 @@ class CameraTests(unittest.TestCase):
         self.assertLess(self.info['luma_stacked'], self.info['luma'])
         self.assertEqual(self.info['source'], 'normal')
         self.assertGreater(self.luma(path), self.info['luma'])
+
+    def test_stacking_reduces_noise(self):
+        # same dim scene, heavy per-frame noise: the 48-frame stack must be much smoother than one frame
+        INPUTS['noisy'] = ['-f', 'lavfi', '-i', 'color=c=0x303030:s=1280x720:r=30,noise=alls=40:allf=t']
+        self.addCleanup(INPUTS.pop, 'noisy')
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        single, stacked = os.path.join(tmp.name, 'single.png'), os.path.join(tmp.name, 'stacked.png')
+
+        async def run():
+            await _camera._ffmpeg([*INPUTS['noisy'], '-frames:v', '1', '-y', single], 30)
+            await _camera._ffmpeg([*INPUTS['noisy'], '-vf', _camera.night_filter(), '-frames:v', '1',
+                                   '-y', stacked], 60)
+            return [await _camera._pixels(p, '320x180', 'gray') for p in (single, stacked)]
+
+        def spread(px):
+            mean = sum(px) / len(px)
+            return (sum((v - mean) ** 2 for v in px) / len(px)) ** 0.5
+
+        one, many = asyncio.run(run())
+        self.assertLess(spread(many), spread(one) / 4)
 
     def test_falls_back_to_mjpeg(self):
         path, _ = self.grab('night', failing_formats=('yuyv422',))
@@ -127,12 +148,12 @@ class CameraTests(unittest.TestCase):
                 return True
 
         path, log = self.grab('night', FakeControls)
-        self.assertEqual(self.info['controls'], 'frame rate may drop, exposure 204.7 ms, gain 255')
+        self.assertEqual(self.info['controls'], 'frame rate may drop')
         self.assertIn('exposure_time_absolute', self.info['readback'])
-        night = calls.index((_camera.CID_EXPOSURE_AUTO, _camera.EXPOSURE_MANUAL))
-        self.assertIn((_camera.CID_EXPOSURE_ABSOLUTE, 2047), calls[night:])
-        self.assertIn((_camera.CID_GAIN, 255), calls[night:])
-        self.assertIn((_camera.CID_EXPOSURE_AUTO_PRIORITY, 1), calls[night - 1:])
+        night = calls.index((_camera.CID_EXPOSURE_AUTO_PRIORITY, 1))
+        # auto exposure stays on: no manual exposure or gain (the C270's manual mode is darker)
+        self.assertNotIn((_camera.CID_EXPOSURE_AUTO, _camera.EXPOSURE_MANUAL), calls)
+        self.assertEqual([c for c, _ in calls[night:]].count(_camera.CID_GAIN), 1)  # only the reset
         self.assertEqual(calls[-4:], [(_camera.CID_EXPOSURE_AUTO, 3), (_camera.CID_EXPOSURE_AUTO_PRIORITY, 0),
                                       (_camera.CID_GAIN, 0), (_camera.CID_EXPOSURE_ABSOLUTE, 250)])  # back to auto
 
