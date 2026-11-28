@@ -7,6 +7,7 @@ Files are `<unix seconds>.jpg`; ones older than the retention period are deleted
 import asyncio
 import fcntl
 import json
+import math
 import os
 import re
 import struct
@@ -25,8 +26,10 @@ TIMEOUT_S = 40
 WARMUP_FRAMES = 30  # auto exposure / white balance need a moment after the stream starts
 
 # Night mode: when a normal snapshot is darker than NIGHT_LUMA (mean luma, 0-255), take
-# NIGHT_GROUPS x NIGHT_GROUP_FRAMES more frames, average them at 16 bits per channel (sensor
-# noise drops ~sqrt(48) = 7x), denoise and stretch each colour channel's levels.
+# prod(NIGHT_STAGES) more frames and average them at 16 bits per channel; random sensor noise
+# drops ~sqrt(frames) (measured: 48 frames 6.8x, 192 frames 13x). The camera and scene are
+# static, so more frames only cost capture time (~5-6 fps at night: 192 frames ~35 s).
+# Then white-balance, stretch and sharpen.
 # The camera stays in auto exposure: the C270 accepts manual exposure values but only honours a
 # few discrete ones, and its manual mode came out far darker than auto (21:33 test: luma 0.4 vs
 # 7.2). It may only lower its frame rate so auto exposure can run longer.
@@ -34,9 +37,11 @@ WARMUP_FRAMES = 30  # auto exposure / white balance need a moment after the stre
 # as <ts>.json (GET .../info).
 NIGHT_LUMA = float(os.environ.get('SMART_FARM_CAMERA_NIGHT_LUMA', '35'))  # 0 disables night mode
 NIGHT_WARMUP_FRAMES = 15  # auto exposure settles after the frame-rate change
-NIGHT_GROUP_FRAMES = 8    # averaged in two stages (8 x 6) so ffmpeg's cost stays linear
-NIGHT_GROUPS = 6
-NIGHT_TIMEOUT_S = 120     # 63 frames at the low frame rates auto exposure picks in the dark
+# Averaged in stages (means of 8, then means of 8 of those, then of 3): tmix re-mixes its
+# whole window for every frame, so one 192-frame window would cost ~25x more CPU and hold
+# 192 16-bit frames (~1 GB) in memory; staged, at most ~19 frames (~100 MB).
+NIGHT_STAGES = tuple(int(n) for n in os.environ.get('SMART_FARM_CAMERA_NIGHT_STAGES', '8,8,3').split(','))
+NIGHT_TIMEOUT_S = 180     # 207 frames at the low frame rates auto exposure picks in the dark
 NIGHT_MAX_GAIN = 12.0     # cap on the level stretch so the remaining noise isn't blown up
 NIGHT_FORMATS = ('yuyv422', 'mjpeg')  # first one the camera accepts is used
 
@@ -169,15 +174,24 @@ def camera_input(device: str = DEVICE, input_format: str = 'mjpeg') -> list[str]
     return ['-f', 'v4l2', '-input_format', input_format, '-video_size', '1280x720', '-i', device]
 
 
-def night_filter(warmup: int = NIGHT_WARMUP_FRAMES, group: int = NIGHT_GROUP_FRAMES,
-                 groups: int = NIGHT_GROUPS) -> str:
-    """Average group*groups frames after `warmup` at 16 bits per channel, then denoise.
+def night_frames(stages: tuple[int, ...] | None = None) -> int:
+    return math.prod(stages or NIGHT_STAGES)
 
-    Two stages (means of `group` frames, then the mean of `groups` of those) because tmix
-    re-mixes its whole window for every frame; one 48-frame window would cost 48x more."""
-    return (f'select=gte(n\\,{warmup}),format=gbrp16le,'
-            f'tmix=frames={group},select=eq(mod(n\\,{group})\\,{group - 1}),'
-            f'tmix=frames={groups},select=gte(n\\,{groups - 1}),hqdn3d=4:3:4:3')
+
+def night_filter(warmup: int = NIGHT_WARMUP_FRAMES, stages: tuple[int, ...] | None = None) -> str:
+    """Average prod(stages) frames after `warmup` at 16 bits per channel, then denoise lightly.
+
+    Each stage averages `n` of the previous stage's outputs and keeps every n-th result, so
+    CPU stays linear in the frame count and memory bounded by sum(stages) frames."""
+    stages = stages or NIGHT_STAGES
+    chain = [f'select=gte(n\\,{warmup})', 'format=gbrp16le']
+    for i, n in enumerate(stages):
+        chain.append(f'tmix=frames={n}')
+        # keep only complete windows; after the last stage, the first complete one is the result
+        chain.append(f'select=gte(n\\,{n - 1})' if i == len(stages) - 1
+                     else f'select=eq(mod(n\\,{n})\\,{n - 1})')
+    chain.append('hqdn3d=2:1.5:3:3')  # light: stacking already removed most noise, keep detail
+    return ','.join(chain)
 
 
 async def _pixels(path: str, size: str, fmt: str) -> bytes:
@@ -191,25 +205,70 @@ async def mean_luma(path: str) -> float:
     return sum(raw) / len(raw) if raw else 0.0
 
 
-async def stretch(src: str, dst: str, low_pct: float = 1.0, high_pct: float = 99.5, gamma: float = 0.8,
-                  max_gain: float = NIGHT_MAX_GAIN) -> dict:
-    """Map each channel's low/high percentiles to black/white, with mild gamma.
+def _pct(values, pct: float) -> float:
+    v = sorted(values)
+    return v[min(len(v) - 1, int(len(v) * pct / 100))]
 
-    Per channel, because in the dark the channels' black levels and sensitivities differ a
-    lot (one shared stretch gave a strong blue cast); percentiles rather than min/max, so a
-    few bright LEDs in view don't cancel the stretch. Returns the levels used."""
+
+def white_balance(px: list[tuple[int, int, int]], grey_tol: float = 0.3, rounds: int = 8,
+                  bin_size: float = 0.025):
+    """(black, gains) for 8-bit RGB pixels: per-channel black points (the darkest shadows),
+    then gains that make the scene's dominant colour (soil, perlite, walls) neutral.
+
+    Plain grey-world (all pixels) is pulled off by the many orange/yellow wires, and stretching
+    each channel to its own white point boosted blue's midtones (blue cast). So: find the most
+    common chromaticity among lit pixels (2-D histogram of r/sum, g/sum, smoothed 3x3), take it
+    as grey, then refine on pixels whose balanced colour is within `grey_tol`."""
+    black = [_pct([p[i] for p in px], 0.5) for i in range(3)]
+    x = [[max(0.0, p[i] - black[i]) for i in range(3)] for p in px]
+    lit = [q for q in x if sum(q) > 6]
+    if len(lit) < 20:
+        return black, [1.0, 1.0, 1.0]
+    hist: dict[tuple[int, int], list] = {}
+    for q in lit:
+        t = sum(q)
+        hist.setdefault((int(q[0] / t / bin_size), int(q[1] / t / bin_size)), []).append(q)
+    density = {k: sum(len(hist.get((k[0] + i, k[1] + j), ())) for i in (-1, 0, 1) for j in (-1, 0, 1))
+               for k in hist}
+    peak = max(density, key=density.get)
+    mode = [q for i in (-1, 0, 1) for j in (-1, 0, 1) for q in hist.get((peak[0] + i, peak[1] + j), ())]
+
+    def neutralise(sample):
+        means = [max(sum(q[i] for q in sample) / len(sample), 1e-3) for i in range(3)]
+        return [sum(means) / 3 / m for m in means]
+
+    gains = neutralise(mode)
+    for _ in range(rounds):
+        grey = []
+        for q in lit:
+            bal = [q[i] * gains[i] for i in range(3)]
+            if max(bal) - min(bal) < grey_tol * sum(bal) / 3:
+                grey.append(q)
+        if len(grey) < len(lit) // 50:  # too few neutral pixels to trust: keep the current gains
+            break
+        gains = neutralise(grey)
+    return black, [min(max(g, 1 / 3), 3.0) for g in gains]
+
+
+async def stretch(src: str, dst: str, high_pct: float = 99.5, gamma: float = 0.85,
+                  max_gain: float = NIGHT_MAX_GAIN, saturation: float = 1.15, sharpen: float = 0.8) -> dict:
+    """Colour-balance and brighten a dark frame, then sharpen it.
+
+    Black point per channel, gains from `white_balance`, one shared white point (the
+    `high_pct` brightness percentile, so a few bright LEDs in view don't cancel the stretch),
+    mild gamma; then a saturation boost and a luma-only unsharp mask (chroma noise untouched).
+    Measured in 8-bit units; `maxval` applies the same curve to 16-bit stacks (no banding)."""
     raw = await _pixels(src, '160x90', 'rgb24')
-    levels = {}
-    for i, name in enumerate('rgb'):
-        ch = sorted(raw[i::3])
-        lo = ch[int(len(ch) * low_pct / 100)]
-        hi = ch[min(len(ch) - 1, int(len(ch) * high_pct / 100))]
-        levels[name] = (lo, max(hi, lo + 255 / max_gain))
-    # levels are in 8-bit units; `maxval` makes the same curve work on 16-bit stacks (no banding)
-    exprs = ':'.join(f"{c}='maxval*pow(clip((val*255/maxval-{lo})/{hi - lo:.2f}\\,0\\,1)\\,{gamma})'"
-                     for c, (lo, hi) in levels.items())
-    await _ffmpeg(['-i', src, '-vf', f'lutrgb={exprs}', '-q:v', '3', '-f', 'image2', '-y', dst], 30)
-    return {c: [lo, round(hi, 1)] for c, (lo, hi) in levels.items()}
+    px = [tuple(raw[i:i + 3]) for i in range(0, len(raw) - 2, 3)]
+    black, gains = white_balance(px)
+    balanced = [sum(max(0.0, p[i] - black[i]) * gains[i] for i in range(3)) / 3 for p in px]
+    white = max(_pct(balanced, high_pct), 255 / max_gain)
+    exprs = ':'.join(
+        f"{c}='maxval*pow(clip((val*255/maxval-{black[i]})*{gains[i] / white:.5f}\\,0\\,1)\\,{gamma})'"
+        for i, c in enumerate('rgb'))
+    vf = f'lutrgb={exprs},eq=saturation={saturation},unsharp=5:5:{sharpen}:5:5:0'
+    await _ffmpeg(['-i', src, '-vf', vf, '-q:v', '3', '-f', 'image2', '-y', dst], 30)
+    return {'black': black, 'gains': [round(g, 3) for g in gains], 'white': round(white, 1)}
 
 
 async def _night_capture(device: str, out: str) -> dict:
@@ -226,7 +285,7 @@ async def _night_capture(device: str, out: str) -> dict:
                                    '-frames:v', '1', '-f', 'image2', '-y', out], NIGHT_TIMEOUT_S)
                     # longer per frame when auto exposure lowers the frame rate
                     info['capture_s'] = round(time.monotonic() - started, 1)
-                    info['frames'] = NIGHT_WARMUP_FRAMES + NIGHT_GROUP_FRAMES * NIGHT_GROUPS
+                    info['frames'] = NIGHT_WARMUP_FRAMES + night_frames()
                     info['input_format'] = fmt
                     return info
                 except RuntimeError as exc:  # e.g. format unsupported: try the next one

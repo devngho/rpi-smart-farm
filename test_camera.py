@@ -33,7 +33,8 @@ class CameraTests(unittest.TestCase):
             return INPUTS[night_scene if night_scene and len(self.formats) > 1 else scene]
 
         patches = [patch.object(_camera, 'camera_input', camera_input),
-                   patch.object(_camera, 'WARMUP_FRAMES', 1)]
+                   patch.object(_camera, 'WARMUP_FRAMES', 1),
+                   patch.object(_camera, 'NIGHT_STAGES', (8, 6))]  # fewer frames keep these tests fast
         if controls is not None:
             patches.append(patch.object(_camera, 'Controls', controls))
         for p in patches:
@@ -63,7 +64,7 @@ class CameraTests(unittest.TestCase):
         self.assertTrue(self.info['night'])
         self.assertEqual(self.info['controls'], 'no controls')  # no webcam here: stacking + levels still apply
         self.assertEqual(self.info['input_format'], 'yuyv422')
-        self.assertEqual(self.info['frames'], _camera.NIGHT_WARMUP_FRAMES + _camera.NIGHT_GROUP_FRAMES * _camera.NIGHT_GROUPS)
+        self.assertEqual(self.info['frames'], _camera.NIGHT_WARMUP_FRAMES + _camera.night_frames())
         self.assertGreaterEqual(self.info['capture_s'], 0)
         self.assertIn(self.info['source'], ('stacked', 'normal'))
         self.assertLess(self.info['luma'], _camera.NIGHT_LUMA)
@@ -71,14 +72,29 @@ class CameraTests(unittest.TestCase):
         self.assertAlmostEqual(self.info['luma_after'], self.luma(path), delta=1)
 
     def test_colour_cast_removed(self):
-        path, _ = self.grab('night')
-        neutral = self.channel_means(path)
-        path, _ = self.grab('night_cast')
-        self.assertTrue(self.info['night'])
-        cast = self.channel_means(path)
-        # same scene with a strong blue cast ends up with about the same colour balance
-        for a, b in zip(neutral, cast):
-            self.assertAlmostEqual(a, b, delta=15, msg=(neutral, cast))
+        # grey box with orange/yellow "wires", dark, with per-frame noise; then the same under a strong blue cast
+        scene = ('color=c=0x808080:s=1280x720:r=10,'
+                 'drawbox=x=100:y=0:w=80:h=720:color=0xff8000:t=fill,'
+                 'drawbox=x=400:y=0:w=60:h=720:color=0xffd000:t=fill,'
+                 'drawbox=x=900:y=0:w=40:h=720:color=0xd02020:t=fill,'
+                 'drawbox=x=0:y=620:w=1280:h=100:color=0x000000:t=fill,')  # shadows / black breadboard
+        INPUTS['grey_scene'] = ['-f', 'lavfi', '-i', scene + 'lutrgb=r=val*0.1:g=val*0.1:b=val*0.1,noise=alls=6:allf=t']
+        INPUTS['grey_scene_cast'] = ['-f', 'lavfi', '-i',
+                                     scene + 'lutrgb=r=val*0.06:g=val*0.05:b=val*0.12+6,noise=alls=6:allf=t']
+        self.addCleanup(INPUTS.pop, 'grey_scene')
+        self.addCleanup(INPUTS.pop, 'grey_scene_cast')
+        results = []
+        for name in ('grey_scene', 'grey_scene_cast'):
+            path, _ = self.grab(name)
+            self.assertTrue(self.info['night'])
+            raw = asyncio.run(_camera._pixels(path, '128x72', 'rgb24'))
+            # background column band x = 70%..85% of the width is plain grey in the scene
+            bg = [raw[(y * 128 + x) * 3:(y * 128 + x) * 3 + 3] for y in range(55) for x in range(96, 108)]
+            results.append([sum(p[i] for p in bg) / len(bg) for i in range(3)])
+        for r, g, b in results:
+            self.assertLess(max(r, g, b) - min(r, g, b), 20, results)  # background stays neutral
+        for a, b in zip(*results):
+            self.assertAlmostEqual(a, b, delta=20, msg=results)  # and the cast makes little difference
 
     def test_darker_long_exposure_falls_back_to_normal_frame(self):
         # night retake darker than the auto-exposure shot, like the first real YUYV attempt
@@ -91,25 +107,42 @@ class CameraTests(unittest.TestCase):
         self.assertGreater(self.luma(path), self.info['luma'])
 
     def test_stacking_reduces_noise(self):
-        # same dim scene, heavy per-frame noise: the 48-frame stack must be much smoother than one frame
+        # same dim scene, heavy per-frame noise: noise must fall with the number of frames stacked
         INPUTS['noisy'] = ['-f', 'lavfi', '-i', 'color=c=0x303030:s=1280x720:r=30,noise=alls=40:allf=t']
         self.addCleanup(INPUTS.pop, 'noisy')
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        single, stacked = os.path.join(tmp.name, 'single.png'), os.path.join(tmp.name, 'stacked.png')
 
-        async def run():
-            await _camera._ffmpeg([*INPUTS['noisy'], '-frames:v', '1', '-y', single], 30)
-            await _camera._ffmpeg([*INPUTS['noisy'], '-vf', _camera.night_filter(), '-frames:v', '1',
-                                   '-y', stacked], 60)
-            return [await _camera._pixels(p, '320x180', 'gray') for p in (single, stacked)]
-
-        def spread(px):
+        async def spread(vf, name):
+            out = os.path.join(tmp.name, name)
+            await _camera._ffmpeg([*INPUTS['noisy'], '-vf', vf, '-frames:v', '1', '-y', out], 60)
+            # full resolution, 16-bit grey: no downscaling or 8-bit rounding hiding the noise
+            raw = await _camera._ffmpeg(['-i', out, '-vf', 'format=gray16le', '-f', 'rawvideo', '-'], 30)
+            px = [int.from_bytes(raw[i:i + 2], 'little') / 257 for i in range(0, len(raw), 2 * 7)]
             mean = sum(px) / len(px)
             return (sum((v - mean) ** 2 for v in px) / len(px)) ** 0.5
 
-        one, many = asyncio.run(run())
-        self.assertLess(spread(many), spread(one) / 4)
+        async def run():
+            return (await spread('select=gte(n\\,15),format=gbrp16le', 'one.png'),
+                    await spread(_camera.night_filter(stages=(8, 6)), 'n48.png'),
+                    await spread(_camera.night_filter(), 'n192.png'))
+
+        one, n48, n192 = asyncio.run(run())
+        self.assertEqual(_camera.night_frames(), 192)
+        self.assertLess(n192, one / 8, (one, n48, n192))   # ~13x in theory
+        self.assertLess(n192, n48 * 0.8, (one, n48, n192))  # more frames still help
+
+    def test_white_balance_ignores_coloured_wires(self):
+        # night frame: shadows at the sensor's black level (red offset 6), grey soil/walls under
+        # a reddish cast (R:G:B = 4:2:1), and as many saturated orange/yellow wire pixels
+        shadows = [(6, 0, 0)] * 100
+        grey = [(6 + 4 * v, 2 * v, v) for v in range(2, 22)] * 30
+        wires = [(96, 40, 8), (90, 80, 6)] * 300
+        black, gains = _camera.white_balance(shadows + grey + wires)
+        self.assertEqual(black, [6, 0, 0])
+        for p in grey[:20]:  # every grey level comes out neutral
+            q = [(p[i] - black[i]) * gains[i] for i in range(3)]
+            self.assertLess(max(q) - min(q), 0.1 * sum(q) / 3 + 0.5, (q, gains))
 
     def test_falls_back_to_mjpeg(self):
         path, _ = self.grab('night', failing_formats=('yuyv422',))
